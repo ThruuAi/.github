@@ -8,12 +8,17 @@
 # marvinamiranda/.github (this repository stays here: provenance is always read
 # from marvinamiranda). In another organisation --self-only is refused and this
 # repository's own rulesets are never touched, and the Checks App proof must
-# come from a check run completed AFTER the transfer (--checks-since <ISO time>):
-# a pull request head from before it carries the old organisation's runs and
-# proves nothing about the Checks App's installation in the new one.
+# come from a check run completed AFTER the transfer: a pull request head from
+# before it carries the old organisation's runs and proves nothing about the
+# Checks App's installation in the new one. The transfer time is NOT taken from
+# the caller: it is read from the new organisation's audit log (the latest
+# repo.transfer event for the repository's id, which GitHub records), so the
+# token also needs Organization permissions > Administration: read. No such
+# event, or an unreadable audit log, refuses --apply of the rulesets.
+# --checks-since can only move that cutoff LATER, never earlier.
 #   governance/bootstrap.sh --org ThruuAi --repo omni237-ops                                       # dry run
 #   governance/bootstrap.sh --org ThruuAi --repo omni237-ops --no-rulesets --probe --apply         # labels, types, env, probe
-#   governance/bootstrap.sh --org ThruuAi --repo omni237-ops --checks-since 2026-10-12T15:00:00Z --apply  # rulesets
+#   governance/bootstrap.sh --org ThruuAi --repo omni237-ops --apply                               # rulesets, after one post-transfer PR is green
 #
 # FIRST, ONCE, straight after this repository's own pull request merges into
 # its test, and before any product repository moves its pin to that commit:
@@ -194,9 +199,10 @@ Options:
                            except with --self-only.
   --org <name>             The organisation to configure: one of $ALLOWED_ORGS.
                            Default $HOME_ORG. Another one never touches $HOME_ORG/$SELF_REPO.
-  --checks-since <time>    ISO 8601 UTC. Required with --org other than $HOME_ORG when
-                           rulesets are applied: the Checks App proof counts only check
-                           runs completed at or after it (the transfer time).
+  --checks-since <time>    ISO 8601 UTC. With --org other than $HOME_ORG the Checks App
+                           proof counts only check runs completed at or after the
+                           repository's transfer, read from $ORG's audit log; this can
+                           only move that cutoff later (an earlier value is ignored).
   --self-only              Only $HOME_ORG/$SELF_REPO's own rulesets (with --probe, its
                            probe too); takes no --repo. The first run, once this
                            repository's own pull request has merged.
@@ -248,10 +254,6 @@ done
 
 if [[ "$ORG" != "$HOME_ORG" ]]; then
   (( ! SELF_ONLY )) || { echo "--self-only configures $HOME_ORG/$SELF_REPO, which lives in $HOME_ORG only: no --org $ORG." >&2; exit 2; }
-  if (( ! SKIP_RULESETS )) && [[ -z "$CHECKS_SINCE" ]]; then
-    echo "--org $ORG with rulesets needs --checks-since <transfer time>: a check run from before the transfer proves nothing about the Checks App in $ORG." >&2
-    exit 2
-  fi
 fi
 if (( SELF_ONLY )); then
   [[ ${#REPOS[@]} -eq 0 ]] || { echo "--self-only applies only $ORG/$SELF_REPO's own rulesets: it takes no --repo." >&2; exit 2; }
@@ -423,13 +425,43 @@ if (( ! SELF_ONLY && ! SKIP_RULESETS )); then
   # Probe ALL targets before ANY mutation, including this repo's rulesets.
   # Both exact contexts must succeed on ONE recent PR head into test. Shadow
   # names, another App, and evidence split across heads cannot qualify.
+  # The transfer cutoff of a repository in another organisation, from GitHub's
+  # own record: the latest repo.transfer audit-log event in $ORG for the
+  # repository's id (ids survive a transfer and a rename; names do not). Sets
+  # CUTOFF (ISO 8601 UTC, rounded UP to the second) or returns 1. Never taken
+  # from the caller: --checks-since may only move it later.
+  CUTOFF=""
+  transfer_cutoff() {
+    local repo="$1" id events derived
+    CUTOFF=""
+    id="$(gh api "repos/$ORG/$repo" --jq .id 2>/dev/null)" || return 1
+    [[ "$id" =~ ^[1-9][0-9]*$ ]] || return 1
+    events="$(gh api "orgs/$ORG/audit-log?phrase=action%3Arepo.transfer+repo%3A$ORG%2F$repo&per_page=100" 2>/dev/null)" || return 1
+    derived="$(jq -er --argjson id "$id" --arg org "$ORG" '
+      [.[]? | select(.action == "repo.transfer" and .repo_id == $id and ((.org // "") | ascii_downcase) == ($org | ascii_downcase))
+            | .["@timestamp"] | select(type == "number")] | max | select(. != null) | (. / 1000 | ceil | todate)' <<<"$events")" || return 1
+    [[ "$derived" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+    CUTOFF="$derived"
+    if [[ -n "$CHECKS_SINCE" ]]; then
+      if [[ "$CHECKS_SINCE" > "$derived" ]]; then CUTOFF="$CHECKS_SINCE"
+      else warn "--checks-since $CHECKS_SINCE is not after $repo's transfer ($derived): ignored, the transfer is the cutoff."; fi
+    fi
+    info "$repo moved to $ORG at $derived (audit log, repository id $id); Checks App runs count from $CUTOFF."
+  }
   checks_publisher_probe() {
-    local repo="$1" prs heads sha runs number updated_at
+    local repo="$1" prs heads sha runs number updated_at since="$CHECKS_SINCE"
+    if [[ "$ORG" != "$HOME_ORG" ]]; then
+      if ! transfer_cutoff "$repo"; then
+        warn "no repo.transfer event for $ORG/$repo readable in $ORG's audit log (the token needs Organization Administration: read): the Checks App proof cannot be dated, so it is not proven."
+        return 1
+      fi
+      since="$CUTOFF"
+    fi
     prs="$(gh api "repos/$ORG/$repo/pulls?state=all&base=test&sort=updated&direction=desc&per_page=20")" || return 1
     heads="$(jq -er '[.[].head.sha | select(test("^[a-f0-9]{40}$"))] | unique | .[]' <<<"$prs")" || return 1
     while IFS= read -r sha; do
       runs="$(gh api --paginate "repos/$ORG/$repo/commits/$sha/check-runs?per_page=100" | jq -se '[.[] | .check_runs[]]')" || return 1
-      if jq -e --argjson id "$CHECKS_APP_ID" --arg sha "$sha" --arg since "$CHECKS_SINCE" '
+      if jq -e --argjson id "$CHECKS_APP_ID" --arg sha "$sha" --arg since "$since" '
         [.[] | select(.app.id == $id and .head_sha == $sha and .conclusion == "success"
                       and ($since == "" or (.completed_at // "") >= $since)) | .name] as $names |
         (["governance/issue-link", "All checks accounted for"] - $names | length) == 0
