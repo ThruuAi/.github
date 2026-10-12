@@ -451,7 +451,9 @@ if [[ $current -eq 0 || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
   } | install_file "$BIN/gh" 700 || locked "cannot write $BIN/gh"
   # mm-gh-org <org> <gh arguments...>: the same gh, with that org's token.
   { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
+    # shellcheck disable=SC2016 # literal text for the generated script
     printf 'org="${1:-}"; case "$org" in marvinamiranda | ThruuAi) ;; *) echo "usage: mm-gh-org <marvinamiranda|ThruuAi> <gh arguments...>" >&2; exit 2 ;; esac\nshift\n'
+    # shellcheck disable=SC2016 # literal text for the generated script
     printf 'MM_GH_ORG="$org" exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
   } | install_file "$BIN/mm-gh-org" 700 || locked "cannot write $BIN/mm-gh-org"
   write_zdotdir "$ZD" "$BIN" "$body" || locked "cannot write the zsh startup files in $ZD"
