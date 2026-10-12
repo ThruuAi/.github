@@ -97,6 +97,7 @@ const fs = require('fs');
 const args = process.argv.slice(2);
 let out = null, fmt = null, method = 'GET', fail = false, url = null;
 const headers = [];
+if (args.includes('-K')) { for (const l of fs.readFileSync(0, 'utf8').split('\\n')) { const m = /^header = "(.*)"$/.exec(l); if (m) headers.push(m[1]); } }
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
@@ -107,7 +108,7 @@ for (let i = 0; i < args.length; i++) {
   else if (/^-[A-Za-z]+$/.test(a) && a.includes('f')) fail = true;
 }
 const auth = (headers.find((h) => /^authorization:/i.test(h)) || '').replace(/^authorization:\\s*/i, '');
-fs.appendFileSync(process.env.FAKE_CURL_LOG, JSON.stringify({ method, url, auth }) + '\\n');
+fs.appendFileSync(process.env.FAKE_CURL_LOG, JSON.stringify({ method, url, auth, argv: args }) + '\\n');
 const scenario = JSON.parse(fs.readFileSync(process.env.FAKE_GH_SCENARIO, 'utf8'));
 const key = method + ' ' + url;
 let r = scenario[key];
@@ -545,6 +546,28 @@ function zshOrSkip(what) {
   ok('git gets an App token from the credential helper',
     /username=x-access-token/.test(g.stdout) && /password=ghs_T2/.test(g.stdout) && rcOf(g.stdout, 'git-rc') === 0,
     (g.stdout + g.stderr).trim());
+
+  // Two orgs: the helper takes the org from the path git sends (useHttpPath).
+  fs.writeFileSync(scenarioFile, JSON.stringify({
+    [`GET ${API}/orgs/${ORG}/installation`]: { status: 200, body: { id: 42 } },
+    [`GET ${API}/orgs/ThruuAi/installation`]: { status: 200, body: { id: 43 } },
+    [`POST ${API}/app/installations/42/access_tokens`]: minted('ghs_MARVINA'),
+    [`POST ${API}/app/installations/43/access_tokens`]: minted('ghs_THRUU'),
+  }));
+  fs.rmSync(CACHE, { force: true });
+  fs.rmSync(`${CACHE}.thruuai`, { force: true });
+  const credFor = (p) => inChild(printed, `printf "protocol=https\\nhost=github.com\\npath=${p}\\n\\n" | git credential fill`);
+  const t = credFor('ThruuAi/sm360wf.git');
+  const m = credFor('marvinamiranda/omni237.git');
+  ok('the helper gives a ThruuAi path the ThruuAi token', /password=ghs_THRUU/.test(t.stdout), (t.stdout + t.stderr).trim());
+  ok('the helper gives any other path the marvinamiranda token', /password=ghs_MARVINA/.test(m.stdout), (m.stdout + m.stderr).trim());
+  inChild(printed, 'gh api plain', { ORG: 'ThruuAi', MM_GH_ORG: 'ThruuAi' });
+  ok('plain gh ignores an ambient ORG / MM_GH_ORG: marvinamiranda token', ghRuns().pop().token === 'ghs_MARVINA', JSON.stringify(ghRuns().slice(-1)));
+  const bad = inChild(printed, 'mm-gh-org OtherOrg api x; echo "rc=$?"');
+  ok('mm-gh-org refuses an org outside the allowlist', /rc=2/.test(bad.stdout) && !/OtherOrg/.test(bad.stdout + bad.stderr.replace(/usage[^\n]*/g, '')), bad.stdout + bad.stderr);
+  const wrapped = inChild(printed, 'mm-gh-org ThruuAi api x');
+  const wr = ghRuns().pop();
+  ok('mm-gh-org <org> runs gh with that org\'s token', wr && wr.token === 'ghs_THRUU' && wr.args.join(' ') === 'api x', JSON.stringify(wr) + wrapped.stderr.trim());
 })();
 
 (function failsClosed() {
@@ -662,8 +685,8 @@ function zshOrSkip(what) {
   ok('the copies are exactly the committed gh-shim.sh and app-token.sh',
     ['gh-shim.sh', 'app-token.sh'].every((f) => readOr(path.join(shim, 'libexec', f), null)
       === git(src, 'show', `HEAD:governance/identity/${f}`) + '\n'), listOr(path.join(shim, 'libexec')).join(','));
-  ok('the helpers are not on PATH: only gh is in the directory PATH gets',
-    listOr(path.join(shim, 'bin')).join(',') === 'gh', listOr(path.join(shim, 'bin')).join(','));
+  ok('the helpers are not on PATH: only gh and the mm-gh-org launcher are in the directory PATH gets',
+    listOr(path.join(shim, 'bin')).join(',') === 'gh,mm-gh-org', listOr(path.join(shim, 'bin')).join(','));
   const helper = inChild(printed, 'git config --get-all credential.https://github.com.helper | tail -1');
   ok('the git credential helper also runs the copy', helper.stdout.includes(path.join(shim, 'libexec', 'app-token.sh')) && !helper.stdout.includes(src), helper.stdout.trim());
 
@@ -987,6 +1010,62 @@ function zshOrSkip(what) {
   ok('after a mint the cache still starts "<expiry> <token>", the line older copies read',
     first.length === 2 && /^\d+$/.test(first[0]) && first[1] === 'ghs_NEW', first.join(' '));
   ok('the cache file is private (0600)', (fs.statSync(CACHE).mode & 0o777) === 0o600, (fs.statSync(CACHE).mode & 0o777).toString(8));
+
+  // Two orgs: the cache is per org, and ORG picks the installation.
+  fresh({ tokens: ['ghs_MARVINA'] });
+  fs.writeFileSync(scenarioFile, JSON.stringify({
+    [`GET ${API}/orgs/${ORG}/installation`]: { status: 200, body: { id: 42 } },
+    [`GET ${API}/orgs/ThruuAi/installation`]: { status: 200, body: { id: 43 } },
+    [`POST ${API}/app/installations/42/access_tokens`]: minted('ghs_MARVINA'),
+    [`POST ${API}/app/installations/43/access_tokens`]: minted('ghs_THRUU'),
+  }));
+  writeCache({ token: 'ghs_MARVINA_CACHED', mintedAgo: 10 });
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { MM_GH_ORG: 'ThruuAi' });
+  ok('ORG=ThruuAi is not served the cached marvinamiranda token, and mints its own', r.stdout.trim() === 'ghs_THRUU' && mints() === 1, `${r.stdout.trim()} ${r.stderr.trim()}`);
+  ok('the marvinamiranda cache is left untouched', readOr(CACHE).includes('ghs_MARVINA_CACHED'), readOr(CACHE));
+  ok('the ThruuAi cache is its own file', readOr(`${CACHE}.thruuai`).includes('ghs_THRUU'), listOr(DIR).join(','));
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { MM_GH_ORG: 'ThruuAi' });
+  ok('a second ThruuAi call reuses its own cache', r.stdout.trim() === 'ghs_THRUU' && mints() === 1, r.stdout.trim());
+  // Hard allowlist; an ambient ORG is ignored; nothing secret in argv; a bad value is never echoed.
+  fs.writeFileSync(`${scenarioFile}.x`, '');
+  const callsBefore = records(curlLog).length;
+  const evil = 'Other-Org\nghs_SECRETVALUE';
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { MM_GH_ORG: evil });
+  ok('an org outside the allowlist is refused with no GitHub call', r.status !== 0 && r.stdout.trim() === '' && records(curlLog).length === callsBefore, r.stderr.trim());
+  ok('a refused org is never echoed', !/Other-Org|SECRETVALUE/.test(r.stderr + r.stdout), r.stderr.trim());
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { MM_GH_ORG: 'OtherInstalledOrg' });
+  ok('an installed third org is refused too', r.status !== 0 && records(curlLog).length === callsBefore, r.stderr.trim());
+  fs.rmSync(CACHE, { force: true });
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { ORG: 'ThruuAi' });
+  ok('an ambient ORG is ignored: marvinamiranda token', r.stdout.trim() === 'ghs_MARVINA', `${r.stdout.trim()} ${r.stderr.trim()}`);
+  ok('no curl call carries a JWT or token in its argv',
+    records(curlLog).every((c) => !c.argv.join(' ').includes('Bearer') && !/ghs_|eyJ/.test(c.argv.join(' '))) && records(curlLog).some((c) => c.auth.startsWith('Bearer ')),
+    JSON.stringify(records(curlLog).map((c) => c.argv)));
+
+  // First install (no bot-id file): the bot lookup keeps its token out of argv.
+  fresh({ tokens: ['ghs_T1'] });
+  agentEnv();
+  const lookups = records(curlLog).filter((c) => /\/users\//.test(c.url));
+  ok('the first-install bot lookup sends its token on stdin, not in argv',
+    lookups.length === 1 && lookups[0].auth.startsWith('Bearer ghs_') && !lookups[0].argv.join(' ').includes('ghs_'), JSON.stringify(lookups));
+
+  // Mutants of app-token.sh: each fix reverted must fail its check above.
+  const mut = (name, edit, probe) => {
+    const dir = fs.mkdtempSync(path.join(root, 'mut-'));
+    const f = path.join(dir, 'app-token.sh');
+    fs.writeFileSync(f, edit(fs.readFileSync(path.join(IDENTITY, 'app-token.sh'), 'utf8')), { mode: 0o755 });
+    fresh({ tokens: ['ghs_T1'] });
+    ok(`mutant (${name}) is caught`, probe(f), name);
+  };
+  const calls = () => records(curlLog);
+  mut('allowlist removed', (t) => t.replace(/case "\$ORG" in\n[^]*?esac\n/, ''), (f) => {
+    run([f, NAME], { MM_GH_ORG: 'OtherInstalledOrg' }); return calls().some((c) => /OtherInstalledOrg/.test(c.url)); });
+  mut('ambient ORG honoured', (t) => t.replace('${MM_GH_ORG:-marvinamiranda}', '${ORG:-${MM_GH_ORG:-marvinamiranda}}'), (f) => {
+    run([f, NAME], { ORG: 'ThruuAi' }); return calls().some((c) => /orgs\/ThruuAi/.test(c.url)); });
+  mut('JWT back in argv', (t) => t.replace("printf 'header = \"Authorization: Bearer %s\"\\n' \"$jwt\" | curl -sS -K -", 'curl -sS -H "Authorization: Bearer $jwt"'), (f) => {
+    run([f, NAME]); return calls().some((c) => c.argv.join(' ').includes('Bearer')); });
+  mut('invalid org echoed', (t) => t.replace('organisation not allowed: only', 'organisation $ORG not allowed: only'), (f) => {
+    const r = run([f, NAME], { MM_GH_ORG: 'LeakyOrg' }); return /LeakyOrg/.test(r.stderr); });
 
   for (const [what, broken] of [
     ['the installation is gone', { installation: { status: 404, body: { message: 'Not Found' } } }],

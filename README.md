@@ -470,6 +470,13 @@ path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
   stored login;
 - gives git a github.com credential helper that mints a token per operation,
   and tells git to quit rather than fall back when it cannot;
+- two organisations, marvinamiranda (default) and ThruuAi: the git credential
+  helper sets `credential.useHttpPath` and takes the org from the requested
+  path (`ThruuAi/...` gets a ThruuAi token, anything else marvinamiranda); the
+  token cache is per org (`token.cache`, `token.cache.thruuai`); and
+  `mm-gh-org <org> <gh arguments...>` runs the same gh with that org's token
+  (for example `mm-gh-org ThruuAi api repos/ThruuAi/sm360wf`). Plain `gh` stays
+  marvinamiranda. The App must be installed on the org.
 - sets the App's bot as git author and committer.
 
 If `agent-env.sh` fails once it is running, it prints an environment with no
