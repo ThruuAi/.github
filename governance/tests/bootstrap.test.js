@@ -396,6 +396,52 @@ if (process.env.BOOTSTRAP_DRIFT_ONLY !== '1') {
     .update(self.stdout.replace(/[a-f0-9]{40}/g, '<commit>').replace(/read now: [a-f0-9]{12}/g, 'read now: <short>')).digest('hex') === '8d14618b821f9c21f5671fc773c32540269983b013b4b83176f016c245ba82a1');
 }
 
+// ----------------------------------------- --org: a repository transferred to ThruuAi ----
+// The rulesets are re-asserted against the new owner. Nothing in marvinamiranda
+// is read or written (this repository's own rulesets included), --self-only is
+// refused, and the Checks App proof counts only check runs completed at or
+// after the transfer: a head from before it carries the old organisation's runs.
+if (process.env.BOOTSTRAP_DRIFT_ONLY !== '1') {
+  const THRUU = 'ThruuAi';
+  const SINCE = '2026-10-12T15:00:00Z';
+  const thruu = (completedAt, extra = {}) => {
+    const out = {};
+    for (const [k, v] of Object.entries(fixtures())) {
+      if (k.includes('/.github/')) continue;
+      out[k.replace(`repos/${ORG}/`, `repos/${THRUU}/`).replace(`orgs/${ORG}/`, `orgs/${THRUU}/`)] = v;
+    }
+    out[`repos/${THRUU}/prod/commits/${'a'.repeat(40)}/check-runs?per_page=100`] = { total_count: 2, check_runs:
+      ['governance/issue-link', 'All checks accounted for'].map((name) => ({ name, head_sha: 'a'.repeat(40), conclusion: 'success', completed_at: completedAt, app: { id: CHECKS_ID } })) };
+    return { ...out, ...extra };
+  };
+  const inHome = (r) => r.calls.filter((c) => c.args.some((a) => a.includes(`repos/${ORG}/`) || a.includes(`orgs/${ORG}/`)));
+  let t = bootstrap(['--org', THRUU, '--checks-since', SINCE], { fx: thruu('2026-10-12T15:30:00Z') });
+  const plan = planned(t.stdout);
+  ok('--org ThruuAi: dry run plans prod rulesets in ThruuAi', t.status === 0 && plan['prod/test-integration'] && plan['prod/main-owner-only'], tail(t));
+  ok('--org ThruuAi: review/independent stays pinned to the Reviewer App', plan['prod/test-integration']
+    && checks(plan['prod/test-integration'].body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID), tail(t));
+  ok('--org ThruuAi: this repository\'s own rulesets are not planned', !Object.keys(plan).some((k) => k.startsWith('.github/')), Object.keys(plan).join(','));
+  ok('--org ThruuAi: nothing in marvinamiranda is read', inHome(t).length === 0, JSON.stringify(inHome(t).slice(0, 2)));
+  ok('--org ThruuAi: the ruleset writes target ThruuAi', /gh api -X POST repos\/ThruuAi\/prod\/rulesets/.test(t.stdout), tail(t));
+  ok('--org ThruuAi: a post-transfer Checks App run proves the publisher', /publisher proven for prod/.test(t.stdout), tail(t));
+  t = bootstrap(['--org', THRUU, '--checks-since', SINCE, '--apply'], { fx: thruu('2026-10-12T14:59:59Z') });
+  ok('--org ThruuAi: a Checks App run from before the transfer refuses --apply before any write', t.status !== 0 && t.writes.length === 0 && /publisher/.test(t.stderr), tail(t));
+  t = bootstrap(['--org', THRUU, '--checks-since', SINCE, '--apply'], { fx: thruu(undefined) });
+  ok('--org ThruuAi: a Checks App run without completed_at cannot qualify', t.status !== 0 && t.writes.length === 0, tail(t));
+  t = bootstrap(['--org', THRUU, '--apply'], { fx: thruu('2026-10-12T15:30:00Z') });
+  ok('--org ThruuAi: rulesets without --checks-since exit 2 before any call', t.status === 2 && t.calls.length === 0 && /--checks-since/.test(t.stderr), tail(t));
+  t = bootstrap(['--org', THRUU, '--no-rulesets'], { fx: thruu('2026-10-12T15:30:00Z') });
+  ok('--org ThruuAi --no-rulesets needs no --checks-since', t.status === 0 && inHome(t).length === 0, tail(t));
+  t = bootstrap(['--org', THRUU, '--self-only'], { repo: false });
+  ok('--org ThruuAi --self-only exits 2 before any call', t.status === 2 && t.calls.length === 0, tail(t));
+  for (const bad of ['thruuai-evil', 'marvinamiranda2', '']) {
+    t = bootstrap(['--org', bad, '--no-rulesets']);
+    ok(`--org ${JSON.stringify(bad)} outside the allow-list exits 2 before any call`, t.status === 2 && t.calls.length === 0, tail(t));
+  }
+  t = bootstrap(['--org', THRUU, '--checks-since', '2026-10-12 15:00']);
+  ok('--checks-since that is not ISO 8601 UTC exits 2', t.status === 2 && t.calls.length === 0, tail(t));
+}
+
 // Step g only inspects secret NAME metadata; never reads or changes key values.
 {
   const repoKey = `repos/${ORG}/prod/actions/secrets?per_page=100`;

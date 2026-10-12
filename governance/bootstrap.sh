@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # Bootstrap the delivery standard (DELIVERY §14) for the marvinamiranda organisation.
 #
+# ANOTHER ORGANISATION (--org ThruuAi): a product repository transferred out of
+# marvinamiranda takes its repository rulesets with it, but they must be
+# re-asserted, and the organisation's issue types created, against the new
+# owner. Run every step below with --org ThruuAi, from the same merged commit of
+# marvinamiranda/.github (this repository stays here: provenance is always read
+# from marvinamiranda). In another organisation --self-only is refused and this
+# repository's own rulesets are never touched, and the Checks App proof must
+# come from a check run completed AFTER the transfer (--checks-since <ISO time>):
+# a pull request head from before it carries the old organisation's runs and
+# proves nothing about the Checks App's installation in the new one.
+#   governance/bootstrap.sh --org ThruuAi --repo omni237-ops                                       # dry run
+#   governance/bootstrap.sh --org ThruuAi --repo omni237-ops --no-rulesets --probe --apply         # labels, types, env, probe
+#   governance/bootstrap.sh --org ThruuAi --repo omni237-ops --checks-since 2026-10-12T15:00:00Z --apply  # rulesets
+#
 # FIRST, ONCE, straight after this repository's own pull request merges into
 # its test, and before any product repository moves its pin to that commit:
 #   governance/bootstrap.sh --self-only                   # dry run
@@ -130,7 +144,12 @@ fi
 ORIG_PWD="$PWD"
 cd /
 
-ORG="marvinamiranda"
+# Where this repository lives: provenance and its own rulesets, always.
+HOME_ORG="marvinamiranda"
+# The organisation configured; --org changes it, from this list only.
+ORG="$HOME_ORG"
+ALLOWED_ORGS="marvinamiranda ThruuAi"
+CHECKS_SINCE=""
 APPLY=0
 REPOS=()
 WANT_PROJECT=0
@@ -173,7 +192,12 @@ usage() {
 Options:
   --repo <name>            Repository in $ORG to configure. Repeatable. Required,
                            except with --self-only.
-  --self-only              Only $ORG/$SELF_REPO's own rulesets (with --probe, its
+  --org <name>             The organisation to configure: one of $ALLOWED_ORGS.
+                           Default $HOME_ORG. Another one never touches $HOME_ORG/$SELF_REPO.
+  --checks-since <time>    ISO 8601 UTC. Required with --org other than $HOME_ORG when
+                           rulesets are applied: the Checks App proof counts only check
+                           runs completed at or after it (the transfer time).
+  --self-only              Only $HOME_ORG/$SELF_REPO's own rulesets (with --probe, its
                            probe too); takes no --repo. The first run, once this
                            repository's own pull request has merged.
   --apply                  Execute the changes. Without it nothing is written.
@@ -210,12 +234,25 @@ while [[ $# -gt 0 ]]; do
     --checks-app-id) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--checks-app-id needs a numeric id" >&2; exit 2; }; CHECKS_APP_ID="$2"; shift ;;
     --config-dir) [[ $# -ge 2 ]] || { echo "--config-dir needs a value" >&2; exit 2; }; CONFIG_DIR="$(cd "$ORIG_PWD" && cd "$2" && pwd)"; shift ;;
     --strict-up-to-date) STRICT_UP_TO_DATE=true ;;
+    --org) [[ $# -ge 2 ]] || { echo "--org needs a value" >&2; exit 2; }
+      case " $ALLOWED_ORGS " in *" $2 "*) ORG="$2" ;; *) echo "--org must be one of: $ALLOWED_ORGS" >&2; exit 2 ;; esac
+      shift ;;
+    --checks-since) [[ $# -ge 2 && "$2" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+      || { echo "--checks-since needs an ISO 8601 UTC time, e.g. 2026-10-12T15:00:00Z" >&2; exit 2; }
+      CHECKS_SINCE="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
 
+if [[ "$ORG" != "$HOME_ORG" ]]; then
+  (( ! SELF_ONLY )) || { echo "--self-only configures $HOME_ORG/$SELF_REPO, which lives in $HOME_ORG only: no --org $ORG." >&2; exit 2; }
+  if (( ! SKIP_RULESETS )) && [[ -z "$CHECKS_SINCE" ]]; then
+    echo "--org $ORG with rulesets needs --checks-since <transfer time>: a check run from before the transfer proves nothing about the Checks App in $ORG." >&2
+    exit 2
+  fi
+fi
 if (( SELF_ONLY )); then
   [[ ${#REPOS[@]} -eq 0 ]] || { echo "--self-only applies only $ORG/$SELF_REPO's own rulesets: it takes no --repo." >&2; exit 2; }
   (( ! SKIP_RULESETS )) || { echo "--self-only applies rulesets, so --no-rulesets would leave it nothing to do." >&2; exit 2; }
@@ -328,12 +365,12 @@ fi
 # which create-app.py runs too.
 # (identity/provenance.sh was sourced at the top.)
 mm_provenance "$SCRIPT_DIR" "$WORK"
-[[ -z "$PROVENANCE_HEAD" ]] || info "Running from $ORG/$SELF_REPO commit $PROVENANCE_HEAD"
-[[ -n "$PROVENANCE_PROBLEM" ]] || info "That commit is on $ORG/$SELF_REPO test (read now: ${PROVENANCE_TEST:0:12})."
+[[ -z "$PROVENANCE_HEAD" ]] || info "Running from $HOME_ORG/$SELF_REPO commit $PROVENANCE_HEAD"
+[[ -n "$PROVENANCE_PROBLEM" ]] || info "That commit is on $HOME_ORG/$SELF_REPO test (read now: ${PROVENANCE_TEST:0:12})."
 not_reviewed="$PROVENANCE_PROBLEM"
 if [[ -n "$not_reviewed" ]]; then
   if [[ $APPLY -eq 1 ]]; then
-    echo "Refusing --apply: $not_reviewed. Check out a merged commit of $ORG/$SELF_REPO by its SHA." >&2
+    echo "Refusing --apply: $not_reviewed. Check out a merged commit of $HOME_ORG/$SELF_REPO by its SHA." >&2
     exit 1
   fi
   warn "$not_reviewed; --apply would refuse to run."
@@ -392,8 +429,9 @@ if (( ! SELF_ONLY && ! SKIP_RULESETS )); then
     heads="$(jq -er '[.[].head.sha | select(test("^[a-f0-9]{40}$"))] | unique | .[]' <<<"$prs")" || return 1
     while IFS= read -r sha; do
       runs="$(gh api --paginate "repos/$ORG/$repo/commits/$sha/check-runs?per_page=100" | jq -se '[.[] | .check_runs[]]')" || return 1
-      if jq -e --argjson id "$CHECKS_APP_ID" --arg sha "$sha" '
-        [.[] | select(.app.id == $id and .head_sha == $sha and .conclusion == "success") | .name] as $names |
+      if jq -e --argjson id "$CHECKS_APP_ID" --arg sha "$sha" --arg since "$CHECKS_SINCE" '
+        [.[] | select(.app.id == $id and .head_sha == $sha and .conclusion == "success"
+                      and ($since == "" or (.completed_at // "") >= $since)) | .name] as $names |
         (["governance/issue-link", "All checks accounted for"] - $names | length) == 0
       ' <<<"$runs" >/dev/null; then
         number="$(jq -r --arg sha "$sha" '[.[] | select(.head.sha == $sha)][0].number' <<<"$prs")"
@@ -717,7 +755,9 @@ if (( PROBE )); then
   if [[ -z "$REVIEWER_APP_ID" ]]; then
     warn "no Reviewer App id; nothing to probe."
   else
-    for repo in ${REPOS[@]+"${REPOS[@]}"} "$SELF_REPO"; do
+    PROBE_REPOS=(${REPOS[@]+"${REPOS[@]}"})
+    [[ "$ORG" != "$HOME_ORG" ]] || PROBE_REPOS+=("$SELF_REPO")
+    for repo in "${PROBE_REPOS[@]}"; do
       fetch "repos/$ORG/$repo/branches/test" || { warn "$repo has no test branch; not probed."; continue; }
       head_sha="$(jq -r .commit.sha <<<"$BODY")"
       jq -n --arg sha "$head_sha" '{name: "review/independent", head_sha: $sha, status: "completed",
@@ -746,7 +786,9 @@ section "e) Rulesets"
 # one Agent App merge into dev are proven before the rulesets make a passing
 # pull request the only way in.
 # This repository first: it holds the code every other repository's checks run.
-if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=(); else RULESET_REPOS=("$SELF_REPO" ${REPOS[@]+"${REPOS[@]}"}); fi
+if (( SKIP_RULESETS )); then info "skipped (--no-rulesets)"; RULESET_REPOS=()
+elif [[ "$ORG" != "$HOME_ORG" ]]; then RULESET_REPOS=(${REPOS[@]+"${REPOS[@]}"}); info "$HOME_ORG/$SELF_REPO's own rulesets are not touched from --org $ORG."
+else RULESET_REPOS=("$SELF_REPO" ${REPOS[@]+"${REPOS[@]}"}); fi
 OURS=" dev-integration test-integration main-owner-only main-checks "
 for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
   info "[$repo]"
