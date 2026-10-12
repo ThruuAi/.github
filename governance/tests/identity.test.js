@@ -545,6 +545,24 @@ function zshOrSkip(what) {
   ok('git gets an App token from the credential helper',
     /username=x-access-token/.test(g.stdout) && /password=ghs_T2/.test(g.stdout) && rcOf(g.stdout, 'git-rc') === 0,
     (g.stdout + g.stderr).trim());
+
+  // Two orgs: the helper takes the org from the path git sends (useHttpPath).
+  fs.writeFileSync(scenarioFile, JSON.stringify({
+    [`GET ${API}/orgs/${ORG}/installation`]: { status: 200, body: { id: 42 } },
+    [`GET ${API}/orgs/ThruuAi/installation`]: { status: 200, body: { id: 43 } },
+    [`POST ${API}/app/installations/42/access_tokens`]: minted('ghs_MARVINA'),
+    [`POST ${API}/app/installations/43/access_tokens`]: minted('ghs_THRUU'),
+  }));
+  fs.rmSync(CACHE, { force: true });
+  fs.rmSync(`${CACHE}.thruuai`, { force: true });
+  const credFor = (p) => inChild(printed, `printf "protocol=https\\nhost=github.com\\npath=${p}\\n\\n" | git credential fill`);
+  const t = credFor('ThruuAi/sm360wf.git');
+  const m = credFor('marvinamiranda/omni237.git');
+  ok('the helper gives a ThruuAi path the ThruuAi token', /password=ghs_THRUU/.test(t.stdout), (t.stdout + t.stderr).trim());
+  ok('the helper gives any other path the marvinamiranda token', /password=ghs_MARVINA/.test(m.stdout), (m.stdout + m.stderr).trim());
+  const wrapped = inChild(printed, 'mm-gh-org ThruuAi api x');
+  const wr = ghRuns().pop();
+  ok('mm-gh-org <org> runs gh with that org\'s token', wr && wr.token === 'ghs_THRUU' && wr.args.join(' ') === 'api x', JSON.stringify(wr) + wrapped.stderr.trim());
 })();
 
 (function failsClosed() {
@@ -662,8 +680,8 @@ function zshOrSkip(what) {
   ok('the copies are exactly the committed gh-shim.sh and app-token.sh',
     ['gh-shim.sh', 'app-token.sh'].every((f) => readOr(path.join(shim, 'libexec', f), null)
       === git(src, 'show', `HEAD:governance/identity/${f}`) + '\n'), listOr(path.join(shim, 'libexec')).join(','));
-  ok('the helpers are not on PATH: only gh is in the directory PATH gets',
-    listOr(path.join(shim, 'bin')).join(',') === 'gh', listOr(path.join(shim, 'bin')).join(','));
+  ok('the helpers are not on PATH: only gh and the mm-gh-org launcher are in the directory PATH gets',
+    listOr(path.join(shim, 'bin')).join(',') === 'gh,mm-gh-org', listOr(path.join(shim, 'bin')).join(','));
   const helper = inChild(printed, 'git config --get-all credential.https://github.com.helper | tail -1');
   ok('the git credential helper also runs the copy', helper.stdout.includes(path.join(shim, 'libexec', 'app-token.sh')) && !helper.stdout.includes(src), helper.stdout.trim());
 
@@ -987,6 +1005,24 @@ function zshOrSkip(what) {
   ok('after a mint the cache still starts "<expiry> <token>", the line older copies read',
     first.length === 2 && /^\d+$/.test(first[0]) && first[1] === 'ghs_NEW', first.join(' '));
   ok('the cache file is private (0600)', (fs.statSync(CACHE).mode & 0o777) === 0o600, (fs.statSync(CACHE).mode & 0o777).toString(8));
+
+  // Two orgs: the cache is per org, and ORG picks the installation.
+  fresh({ tokens: ['ghs_MARVINA'] });
+  fs.writeFileSync(scenarioFile, JSON.stringify({
+    [`GET ${API}/orgs/${ORG}/installation`]: { status: 200, body: { id: 42 } },
+    [`GET ${API}/orgs/ThruuAi/installation`]: { status: 200, body: { id: 43 } },
+    [`POST ${API}/app/installations/42/access_tokens`]: minted('ghs_MARVINA'),
+    [`POST ${API}/app/installations/43/access_tokens`]: minted('ghs_THRUU'),
+  }));
+  writeCache({ token: 'ghs_MARVINA_CACHED', mintedAgo: 10 });
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { ORG: 'ThruuAi' });
+  ok('ORG=ThruuAi is not served the cached marvinamiranda token, and mints its own', r.stdout.trim() === 'ghs_THRUU' && mints() === 1, `${r.stdout.trim()} ${r.stderr.trim()}`);
+  ok('the marvinamiranda cache is left untouched', readOr(CACHE).includes('ghs_MARVINA_CACHED'), readOr(CACHE));
+  ok('the ThruuAi cache is its own file', readOr(`${CACHE}.thruuai`).includes('ghs_THRUU'), listOr(DIR).join(','));
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { ORG: 'ThruuAi' });
+  ok('a second ThruuAi call reuses its own cache', r.stdout.trim() === 'ghs_THRUU' && mints() === 1, r.stdout.trim());
+  r = run([path.join(IDENTITY, 'app-token.sh'), NAME], { ORG: 'bad/org' });
+  ok('an ORG that is not an org name is refused', r.status !== 0 && r.stdout.trim() === '', r.stderr.trim());
 
   for (const [what, broken] of [
     ['the installation is gone', { installation: { status: 404, body: { message: 'Not Found' } } }],

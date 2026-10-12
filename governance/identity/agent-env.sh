@@ -116,9 +116,12 @@ body_lines() {
   printf 'export ZDOTDIR=%s\n' "$(q "$2")"
   printf 'export GIT_AUTHOR_NAME=%s GIT_COMMITTER_NAME=%s\n' "$(q "$3")" "$(q "$3")"
   printf 'export GIT_AUTHOR_EMAIL=%s GIT_COMMITTER_EMAIL=%s\n' "$(q "$4")" "$(q "$4")"
-  printf 'export GIT_CONFIG_COUNT=2\n'
+  printf 'export GIT_CONFIG_COUNT=3\n'
   printf 'export GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0=\n'
   printf 'export GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1=%s\n' "$(q "$5")"
+  # git sends the repository path to the helper only with useHttpPath; the
+  # helper picks the org from it (ThruuAi/..., else marvinamiranda).
+  printf 'export GIT_CONFIG_KEY_2=credential.https://github.com.useHttpPath GIT_CONFIG_VALUE_2=true\n'
   if [[ -n "${6:-}" ]]; then
     printf 'export MM_REAL_GH_BIN=%s\n' "$(q "$6")"
   else
@@ -389,7 +392,7 @@ email="${bot_id}+${bot}@users.noreply.github.com"
 # For `get`: a fresh token, or quit=true when there is none, so git neither
 # prompts nor tries another credential.
 # shellcheck disable=SC2016  # git's shell expands these when it runs the helper
-helper='!f(){ test "$1" = get || exit 0; t=$('"$(q "$TOKEN_CMD") $(q "$NAME")"') || t=; case "$t" in ghs_?*) printf "username=x-access-token\npassword=%s\n" "$t";; *) echo quit=true;; esac; }; f'
+helper='!f(){ test "$1" = get || exit 0; p=$(sed -n "s/^path=//p" | head -n 1); case "$p" in [Tt][Hh][Rr][Uu][Uu][Aa][Ii]/*) o=ThruuAi;; *) o=marvinamiranda;; esac; t=$(ORG=$o '"$(q "$TOKEN_CMD") $(q "$NAME")"') || t=; case "$t" in ghs_?*) printf "username=x-access-token\npassword=%s\n" "$t";; *) echo quit=true;; esac; }; f'
 
 # GH_PACKAGES_TOKEN. GitHub Packages accepts only a classic personal access
 # token, which no App can mint, so the owner makes one with read:packages alone
@@ -439,13 +442,18 @@ fi
 body="$(body_lines "$GH_DIR" "$ZD" "$bot" "$email" "$helper" "$real_gh")"
 stamp="$real_gh"$'\n'"$body"
 current=1
-for f in "$BIN/gh" "$ZD/reassert.zsh" "$ZD/.zshenv" "$ZD/.zprofile" "$ZD/.zshrc" "$ZD/.zlogin" "$ZD/.zlogout" "$SHIM/.installed"; do
+for f in "$BIN/gh" "$BIN/mm-gh-org" "$ZD/reassert.zsh" "$ZD/.zshenv" "$ZD/.zprofile" "$ZD/.zshrc" "$ZD/.zlogin" "$ZD/.zlogout" "$SHIM/.installed"; do
   [[ -e "$f" ]] || current=0
 done
 if [[ $current -eq 0 || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
   { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
     printf 'exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
   } | install_file "$BIN/gh" 700 || locked "cannot write $BIN/gh"
+  # mm-gh-org <org> <gh arguments...>: the same gh, with that org's token.
+  { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
+    printf 'org="${1:-}"; [[ "$org" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo "usage: mm-gh-org <org> <gh arguments...>" >&2; exit 2; }\nshift\n'
+    printf 'ORG="$org" exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
+  } | install_file "$BIN/mm-gh-org" 700 || locked "cannot write $BIN/mm-gh-org"
   write_zdotdir "$ZD" "$BIN" "$body" || locked "cannot write the zsh startup files in $ZD"
   printf '%s\n' "$stamp" | install_file "$SHIM/.installed" 600 || locked "cannot write $SHIM/.installed"
 fi

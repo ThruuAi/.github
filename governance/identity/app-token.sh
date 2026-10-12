@@ -19,7 +19,8 @@
 # document that a cheap endpoint reflects a suspension. The cap costs two
 # requests per identity every 5 minutes.
 #
-# Prints only an installation token (ghs_...); anything else, from the cache
+# ORG selects the organisation (default marvinamiranda); the App must be
+# installed on it. Prints only an installation token (ghs_...); anything else, from the cache
 # or from GitHub, is a failure. Never echoes the private key, or a token on
 # failure: a failed call prints its HTTP status and GitHub's message, and a
 # 401 discards the cache.
@@ -27,9 +28,13 @@ set -euo pipefail
 
 NAME=${1:?usage: app-token.sh <mm-agent|mm-reviewer>}
 ORG=${ORG:-marvinamiranda}
+[[ "$ORG" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo "ORG=$ORG is not a GitHub organisation name" >&2; exit 1; }
 DIR="$HOME/.config/mm-agent/$NAME"
 KEY="$DIR/private-key.pem"
-CACHE="$DIR/token.cache"
+# One cache per org: an installation token is valid for one org's repositories
+# only. marvinamiranda keeps the original file name, so older copies of this
+# script keep reading it; any other org gets token.cache.<org> (lower-cased).
+if [[ "$ORG" == marvinamiranda ]]; then CACHE="$DIR/token.cache"; else CACHE="$DIR/token.cache.$(printf '%s' "$ORG" | tr 'A-Z' 'a-z')"; fi
 REUSE_SECONDS=300
 [[ -r "$KEY" && -r "$DIR/app.json" ]] || { echo "missing $DIR — the owner creates it with python3 -I -S governance/identity/create-app.py $NAME" >&2; exit 1; }
 
@@ -90,7 +95,7 @@ is_installation_token "$tok" || { echo "Installation token for $NAME: GitHub ret
 
 # Written whole, then renamed over the cache, so no reader sees half a line.
 umask 077
-tmp="$(mktemp "$DIR/token.cache.XXXXXX")"
+tmp="$(mktemp "$DIR/.token.new.XXXXXX")"
 printf '%s %s\n%s\n' "$exp" "$tok" "$now" >"$tmp"
 mv -f "$tmp" "$CACHE"
 tmp=""
