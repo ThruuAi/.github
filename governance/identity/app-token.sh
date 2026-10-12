@@ -19,7 +19,7 @@
 # document that a cheap endpoint reflects a suspension. The cap costs two
 # requests per identity every 5 minutes.
 #
-# ORG selects the organisation (default marvinamiranda); the App must be
+# MM_GH_ORG selects the organisation (marvinamiranda or ThruuAi; default marvinamiranda); the App must be
 # installed on it. Prints only an installation token (ghs_...); anything else, from the cache
 # or from GitHub, is a failure. Never echoes the private key, or a token on
 # failure: a failed call prints its HTTP status and GitHub's message, and a
@@ -27,14 +27,19 @@
 set -euo pipefail
 
 NAME=${1:?usage: app-token.sh <mm-agent|mm-reviewer>}
-ORG=${ORG:-marvinamiranda}
-[[ "$ORG" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo "ORG=$ORG is not a GitHub organisation name" >&2; exit 1; }
+# The organisation comes from MM_GH_ORG, set only by mm-gh-org and by the git
+# credential helper; an ambient ORG is ignored. Only these two are served.
+ORG=${MM_GH_ORG:-marvinamiranda}
+case "$ORG" in
+  marvinamiranda | ThruuAi) ;;
+  *) echo "organisation not allowed: only marvinamiranda and ThruuAi are served" >&2; exit 1 ;;
+esac
 DIR="$HOME/.config/mm-agent/$NAME"
 KEY="$DIR/private-key.pem"
 # One cache per org: an installation token is valid for one org's repositories
 # only. marvinamiranda keeps the original file name, so older copies of this
 # script keep reading it; any other org gets token.cache.<org> (lower-cased).
-if [[ "$ORG" == marvinamiranda ]]; then CACHE="$DIR/token.cache"; else CACHE="$DIR/token.cache.$(printf '%s' "$ORG" | tr 'A-Z' 'a-z')"; fi
+if [[ "$ORG" == marvinamiranda ]]; then CACHE="$DIR/token.cache"; else CACHE="$DIR/token.cache.thruuai"; fi
 REUSE_SECONDS=300
 [[ -r "$KEY" && -r "$DIR/app.json" ]] || { echo "missing $DIR — the owner creates it with python3 -I -S governance/identity/create-app.py $NAME" >&2; exit 1; }
 
@@ -70,8 +75,9 @@ trap 'rm -f "$BODY_FILE" ${tmp:+"$tmp"}' EXIT
 api() {
   local what="$1"; shift
   local status
-  status=$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
-    -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+  # The JWT goes to curl on stdin (-K -), never in its argv.
+  status=$(printf 'header = "Authorization: Bearer %s"\n' "$jwt" | curl -sS -K - -o "$BODY_FILE" -w '%{http_code}' \
+    -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" "$@") || { echo "$what: request failed (network)" >&2; return 1; }
   if [[ "$status" != 2* ]]; then
     local message
