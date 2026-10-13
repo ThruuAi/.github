@@ -139,6 +139,7 @@ require('fs').appendFileSync(process.env.FAKE_REAL_GH_LOG, JSON.stringify({
   githubEnterpriseToken: process.env.GITHUB_ENTERPRISE_TOKEN === undefined ? null : process.env.GITHUB_ENTERPRISE_TOKEN,
   args: process.argv.slice(2), input }) + '\\n');
 console.log('real gh ran: ' + process.argv.slice(2).join(' '));
+process.exit(Number(process.env.FAKE_REAL_GH_EXIT || 0));
 `, { mode: 0o755 });
 const REAL_GH_CANON = fs.realpathSync(REAL_GH);
 
@@ -316,6 +317,109 @@ function zshOrSkip(what) {
   else console.log(`ok - # SKIP zsh not installed: ${what}`);
   return false;
 }
+
+
+// Reinstall regenerates trusted routing from the committed source, including
+// when an old stamp survives missing, corrupted or non-executable artifacts.
+(function installedLifecycle() {
+  fresh(); canonTest('head');
+  const first = agentEnv();
+  const artifacts = ['bin/gh', 'bin/mm-gh-org', 'libexec/gh-shim.sh', 'libexec/app-token.sh',
+    'zdotdir/reassert.zsh', 'zdotdir/.zshenv', 'zdotdir/.zprofile', 'zdotdir/.zshrc', 'zdotdir/.zlogin', 'zdotdir/.zlogout'];
+  const expected = Object.fromEntries(artifacts.map((f) => [f, fs.readFileSync(path.join(SHIM(), f))]));
+  const repeat = agentEnv();
+  ok('repeated installation preserves canonical launcher/libexec/startup bytes and executable modes',
+    first.status === 0 && repeat.status === 0 && artifacts.every((f) => fs.readFileSync(path.join(SHIM(), f)).equals(expected[f]))
+      && artifacts.filter((f) => !f.startsWith('zdotdir/')).every((f) => (fs.statSync(path.join(SHIM(), f)).mode & 0o100) !== 0), '');
+  for (const f of artifacts) {
+    for (const damage of ['missing', 'tampered', 'unreadable']) {
+      const file = path.join(SHIM(), f);
+      if (damage === 'missing') fs.rmSync(file);
+      else if (damage === 'tampered') fs.appendFileSync(file, '\n# corrupted installed artifact\n');
+      else fs.chmodSync(file, 0o000);
+      const repaired = agentEnv();
+      ok(`reinstallation repairs ${damage} ${f} despite an unchanged install stamp`,
+        repaired.status === 0 && readOr(file, null) === expected[f].toString()
+          && (fs.statSync(file).mode & (f.startsWith('zdotdir/') ? 0o400 : 0o500)) === (f.startsWith('zdotdir/') ? 0o400 : 0o500),
+        `installer=${repaired.status}`);
+    }
+    if (!f.startsWith('libexec/')) {
+      const file = path.join(SHIM(), f);
+      const external = path.join(root, 'external-artifact');
+      fs.writeFileSync(external, expected[f], { mode: f.startsWith('zdotdir/') ? 0o600 : 0o700 });
+      fs.chmodSync(external, f.startsWith('zdotdir/') ? 0o600 : 0o700);
+      fs.rmSync(file); fs.symlinkSync(external, file);
+      const repaired = agentEnv();
+      ok(`reinstallation replaces a matching symlink for ${f} with a canonical regular file`,
+        repaired.status === 0 && !fs.lstatSync(file).isSymbolicLink() && readOr(file) === expected[f].toString(), '');
+    }
+    if (!f.startsWith('zdotdir/')) {
+      const file = path.join(SHIM(), f);
+      fs.chmodSync(file, 0o600);
+      const repaired = agentEnv();
+      ok(`reinstallation restores executable mode of ${f}`, repaired.status === 0 && (fs.statSync(file).mode & 0o100) !== 0, '');
+    }
+  }
+
+  // Re-read the saved environment after a launcher disappears; && must stop
+  // the caller before it can perform a command under an incomplete identity.
+  fs.rmSync(path.join(SHIM(), 'bin', 'mm-gh-org'));
+  fs.writeFileSync(curlLog, ''); fs.writeFileSync(ghLog, '');
+  const missing = run(['-c', 'source "$1" && echo accepted', '_', path.join(DIR, 'env')]);
+  ok('saved environment refuses a missing mm-gh-org before any mint/gh/caller command',
+    missing.status !== 0 && !missing.stdout.includes('accepted') && records(curlLog).length === 0 && ghRuns().length === 0, '');
+  agentEnv();
+
+  fs.writeFileSync(scenarioFile, JSON.stringify({
+    [`GET ${API}/orgs/${ORG}/installation`]: { status: 200, body: { id: 42 } },
+    [`GET ${API}/orgs/ThruuAi/installation`]: { status: 200, body: { id: 43 } },
+    [`POST ${API}/app/installations/42/access_tokens`]: minted('ghs_LIFECYCLE_MARVINA'),
+    [`POST ${API}/app/installations/43/access_tokens`]: minted('ghs_LIFECYCLE_THRUU'),
+  }));
+  for (const f of [CACHE, `${CACHE}.thruuai`]) fs.rmSync(f, { force: true });
+  const printed = agentEnv().stdout;
+  const secrets = ['ghs_LIFECYCLE_MARVINA', 'ghs_LIFECYCLE_THRUU', OWNER, PKG];
+  for (const org of ['marvinamiranda', 'ThruuAi']) {
+    fs.writeFileSync(ghLog, '');
+    const routed = inChild(printed, `mm-gh-org ${org} api route`, { FAKE_REAL_GH_EXIT: '37' });
+    const runs = ghRuns();
+    const token = org === 'ThruuAi' ? secrets[1] : secrets[0];
+    ok(`named ${org} gets its distinct installation token in gh environment and preserves exit 37`,
+      routed.status === 37 && runs.length === 1 && runs[0].token === token && runs[0].args.join(' ') === 'api route', '');
+    ok(`named ${org} token is absent from gh/curl argv and raw stdout/stderr`,
+      !secrets.some((t) => (routed.stdout + routed.stderr).includes(t))
+        && runs.every((c) => !secrets.some((t) => c.args.join(' ').includes(t)))
+        && records(curlLog).every((c) => !/ghs_|eyJ/.test(c.argv.join(' '))), '');
+  }
+  for (const arg of ['', 'OtherOrg', 'ThruuAi/extra', 'thruuai']) {
+    for (const f of [CACHE, `${CACHE}.thruuai`]) fs.rmSync(f, { force: true });
+    fs.writeFileSync(curlLog, ''); fs.writeFileSync(ghLog, '');
+    const refused = inChild(printed, `mm-gh-org ${arg ? JSON.stringify(arg) : ''}`);
+    ok(`missing/unknown org ${JSON.stringify(arg)} refuses with zero mint/API/gh and no sentinel output`,
+      refused.status === 2 && records(curlLog).length === 0 && ghRuns().length === 0
+        && !secrets.some((t) => (refused.stdout + refused.stderr).includes(t)), '');
+  }
+
+  // Atomic replacement failure must print the existing locked environment,
+  // never a success environment; the stamp is left behind but cannot hide it.
+  const target = path.join(SHIM(), 'bin', 'mm-gh-org');
+  fs.appendFileSync(target, '\n# corrupted for interrupted copy\n');
+  const stamp = readOr(path.join(SHIM(), '.installed'));
+  const mv = path.join(stubBin, 'mv');
+  fs.writeFileSync(mv, `#!/usr/bin/env bash\nfor last; do :; done\nif [ "$last" = ${JSON.stringify(target)} ]; then exit 74; fi\nexec /bin/mv "$@"\n`, { mode: 0o755 });
+  const interrupted = agentEnv();
+  fs.rmSync(mv);
+  fs.writeFileSync(curlLog, ''); fs.writeFileSync(ghLog, '');
+  const locked = inChild(interrupted.stdout, 'gh api forbidden; echo "gh-rc=$?"');
+  ok('failed atomic launcher replacement emits a locked failing environment and leaves the stamp unchanged',
+    interrupted.status !== 0 && /eval-rc=1/.test(locked.stderr) && rcOf(locked.stdout, 'gh-rc') !== 0
+      && ghRuns().length === 0 && readOr(path.join(SHIM(), '.installed')) === stamp, `installer=${interrupted.status}`);
+  ok('failed installation raw output leaks no sentinel credentials',
+    !secrets.some((t) => (interrupted.stdout + interrupted.stderr + locked.stdout + locked.stderr).includes(t)), '');
+  const recovered = agentEnv();
+  ok('a later reinstall recovers the interrupted artifact to canonical bytes',
+    recovered.status === 0 && fs.readFileSync(target).equals(expected['bin/mm-gh-org']), '');
+})();
 
 // --------------------------------------------------- agent-env.sh (B1) ----
 (function prints() {

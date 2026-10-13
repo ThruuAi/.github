@@ -234,7 +234,7 @@ write_zdotdir() {
   { mkdir -p "$1" && chmod 700 "$1"; } || return 1
   reassert_zsh "$2" "$3" | install_file "$1/reassert.zsh" 600 || return 1
   for f in .zshenv .zprofile .zshrc .zlogin .zlogout; do
-    startup_zsh "$f" "$1" | install_file "$1/$f" 600 || return 1
+    startup_zsh "$f" "${4:-$1}" | install_file "$1/$f" 600 || return 1
   done
 }
 
@@ -435,28 +435,37 @@ PY
   fi
 fi
 
-# The launcher, the only file in the directory PATH gets, so the helpers stay
-# off PATH; it execs the copy, and never falls through to the real gh. Then the
-# zsh startup files. Rewritten whenever what they hold changes, or one is
-# missing; the stamp that says they are current is written last.
+# Generate canonical launchers and zsh files from the verified source before
+# comparing the installed artifacts. A surviving stamp cannot vouch for their
+# current bytes or modes. Each replacement remains atomic; stamp written last.
 body="$(body_lines "$GH_DIR" "$ZD" "$bot" "$email" "$helper" "$real_gh")"
 stamp="$real_gh"$'\n'"$body"
-current=1
-for f in "$BIN/gh" "$BIN/mm-gh-org" "$ZD/reassert.zsh" "$ZD/.zshenv" "$ZD/.zprofile" "$ZD/.zshrc" "$ZD/.zlogin" "$ZD/.zlogout" "$SHIM/.installed"; do
-  [[ -e "$f" ]] || current=0
+generated="$STAGE/generated"
+mkdir -p "$generated/bin" || locked "cannot stage generated launchers"
+{ printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
+  printf 'unset MM_GH_ORG\nexec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
+} >"$generated/bin/gh" || locked "cannot stage gh launcher"
+# mm-gh-org <org> <gh arguments...>: the same gh, with that org's token.
+{ printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
+  # shellcheck disable=SC2016 # literal text for the generated script
+  printf 'org="${1:-}"; case "$org" in marvinamiranda | ThruuAi) ;; *) echo "usage: mm-gh-org <marvinamiranda|ThruuAi> <gh arguments...>" >&2; exit 2 ;; esac\nshift\n'
+  # shellcheck disable=SC2016 # literal text for the generated script
+  printf 'MM_GH_ORG="$org" exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
+} >"$generated/bin/mm-gh-org" || locked "cannot stage mm-gh-org launcher"
+write_zdotdir "$generated/zdotdir" "$BIN" "$body" "$ZD" || locked "cannot stage zsh startup files"
+{ mkdir -p "$ZD" && chmod 700 "$ZD"; } || locked "cannot create $ZD"
+GENERATED_FILES=(bin/gh bin/mm-gh-org zdotdir/reassert.zsh zdotdir/.zshenv zdotdir/.zprofile zdotdir/.zshrc zdotdir/.zlogin zdotdir/.zlogout)
+for f in "${GENERATED_FILES[@]}"; do
+  mode=600
+  executable=0
+  if [[ "$f" == bin/* ]]; then mode=700; executable=1; fi
+  if [[ ! -f "$SHIM/$f" || -L "$SHIM/$f" || ! -r "$SHIM/$f" ]] \
+      || { [[ "$executable" -eq 1 ]] && [[ ! -x "$SHIM/$f" ]]; } \
+      || ! cmp -s "$generated/$f" "$SHIM/$f"; then
+    install_file "$SHIM/$f" "$mode" <"$generated/$f" || locked "cannot write $SHIM/$f"
+  fi
 done
-if [[ $current -eq 0 || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
-  { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
-    printf 'unset MM_GH_ORG\nexec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
-  } | install_file "$BIN/gh" 700 || locked "cannot write $BIN/gh"
-  # mm-gh-org <org> <gh arguments...>: the same gh, with that org's token.
-  { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
-    # shellcheck disable=SC2016 # literal text for the generated script
-    printf 'org="${1:-}"; case "$org" in marvinamiranda | ThruuAi) ;; *) echo "usage: mm-gh-org <marvinamiranda|ThruuAi> <gh arguments...>" >&2; exit 2 ;; esac\nshift\n'
-    # shellcheck disable=SC2016 # literal text for the generated script
-    printf 'MM_GH_ORG="$org" exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
-  } | install_file "$BIN/mm-gh-org" 700 || locked "cannot write $BIN/mm-gh-org"
-  write_zdotdir "$ZD" "$BIN" "$body" || locked "cannot write the zsh startup files in $ZD"
+if [[ ! -f "$SHIM/.installed" || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
   printf '%s\n' "$stamp" | install_file "$SHIM/.installed" 600 || locked "cannot write $SHIM/.installed"
 fi
 
@@ -515,7 +524,7 @@ env_script() {
 # missing file, or a missing shim, stops the command:
 #   . ~/.config/mm-agent/$NAME/env && gh pr create ...
 # commit: $commit
-if [ -x $(q "$BIN/gh") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ]; then
+if [ -x $(q "$BIN/gh") ] && [ -x $(q "$BIN/mm-gh-org") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ]; then
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
 ${packages_line:-: no packages token}
