@@ -423,12 +423,11 @@ the owner's machine; `command gh` sidesteps one); and the snapshot files keep
 whatever was exported when they were taken (Codex writes them readable by
 every local user). Only the owner can clear those files.
 
-`agent-env.sh` is a strong default, not a sandbox: agents run on the owner's
-machine as the owner's user, and the owner's keyring login stays one absolute
-path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
+`agent-env.sh` sets up the identity as follows. Its integrity checks and trust
+limits are described in [Identity integrity and doctor](#identity-integrity-and-doctor).
 
 - puts the identity's `gh` first on `PATH`: a launcher in
-  `~/.config/mm-agent/<name>/shim/<commit>/bin/`, the only file there, for
+  `~/.config/mm-agent/<name>/shim/<commit>/bin/`, alongside `mm-gh-org`, for
   copies of `gh-shim.sh` and `app-token.sh` in `…/libexec/`: the working
   files' bytes that were read once and checked against a commit, never what
   the checkout's object store says. Which commit a shell runs depends on the
@@ -439,13 +438,14 @@ path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
   - the env file runs the commit it names: the last one an eval from a commit
     on `test` installed on this machine. The checkout can change or go away
     without touching it;
-- refuses a checkout whose three identity scripts differ from its HEAD commit
+- refuses a checkout whose identity scripts (`agent-env.sh`, `gh-shim.sh`,
+  `app-token.sh` and the pure `launcher-render.sh`) differ from its HEAD commit
   (compared by content, so a change hidden from `git status` counts), and
   warns when that commit is not on this repository's `test`, or its scripts
   there are not the ones read. It runs no git in the checkout (so nothing in
   its config runs), and decides "on `test`" in a repository of its own that it
   fetches `test` into, as `provenance.sh` does. The answer is remembered as the
-  three blob ids that were checked; anything else is asked again at the next
+  source blob ids that were checked; anything else is asked again at the next
   eval;
 - keeps that `gh` first in zsh, login or interactive, without editing the
   owner's files: `ZDOTDIR` points at startup files that source the owner's
@@ -478,6 +478,47 @@ path away (`/opt/homebrew/bin/gh auth token --user <owner>`). What it does:
   (for example `mm-gh-org ThruuAi api repos/ThruuAi/sm360wf`). Plain `gh` stays
   marvinamiranda. The App must be installed on the org.
 - sets the App's bot as git author and committer.
+
+### Identity integrity and doctor
+
+The installer repairs missing, modified or non-executable launchers and startup
+files from its verified source. It records the saved installation's merged
+commit, identity profile and real-gh path in `installation.json`, and writes the
+canonical launcher hashes atomically to `launcher-pins.json` under the shim.
+Every source of the saved environment checks both `gh` and `mm-gh-org` as regular
+executable files against those pins before accepting the identity.
+
+These checks protect against accidental or stray modification, a stale shim,
+a partial install or an edit to the wrong file. A hostile process running as
+the same macOS user can read the user's tokens and private key and rewrite all
+user-owned launchers, pins, environment, installation record and doctor code.
+Replacing a launcher and its pin together can therefore pass the environment
+check. Hostile same-user protection and root-owned pinning are outside this
+mechanism's scope; it is a strong default, not a sandbox. The owner's keyring
+login also remains accessible to that user, and repository rulesets remain a
+separate backstop.
+
+The read-only doctor diagnoses drift against the recorded commit, independently
+verified as merged on `marvinamiranda/.github` `test`. It fetches that public
+source into disposable scratch, runs only the commit's pure launcher renderer,
+and compares both installed launchers and both pins with the canonical result.
+It does not execute the saved environment or installed launchers, mint a token,
+call gh, rewrite installed files, repair pins, or change checkout refs or caches.
+The scratch files are cleaned. It remains a user-owned diagnostic tool and does
+not establish independence from a hostile same-user process.
+
+```bash
+TMPDIR="$HOME/repo/_work" <checkout>/governance/identity/agent-env.sh doctor mm-agent
+# or doctor mm-reviewer
+```
+
+Use an existing owned scratch directory and a reviewed merged checkout.
+Installations made before the record and renderer existed need a reinstall from
+reviewed merged source before this diagnostic can succeed. Missing or malformed
+records or pins, missing launchers, canonical source unavailability, an unmerged
+recorded commit, and canonical mismatches produce fixed typed reasons and a
+nonzero exit. The doctor never guesses legacy bytes, silently migrates state, or
+falls back to installation. `agent-env doctor: Ok` is the successful result.
 
 If `agent-env.sh` fails once it is running, it prints an environment with no
 identity (the sentinel, `gh` refusing and kept first in zsh the same way, git

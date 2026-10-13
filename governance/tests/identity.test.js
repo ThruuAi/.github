@@ -44,7 +44,7 @@ const SYS_PATH = (process.env.PATH || '').split(':').filter((e) => e.startsWith(
 const IDENTITY_SRC = process.env.IDENTITY_DIR
   ? path.resolve(process.env.IDENTITY_DIR)
   : path.join(__dirname, '..', 'identity');
-const SCRIPTS = ['agent-env.sh', 'gh-shim.sh', 'app-token.sh', 'provenance.sh'];
+const SCRIPTS = ['agent-env.sh', 'gh-shim.sh', 'app-token.sh', 'provenance.sh', 'launcher-render.sh'];
 const NAME = 'mm-agent';
 const SLUG = 'fake-agent';
 const ORG = 'marvinamiranda';
@@ -319,6 +319,123 @@ function zshOrSkip(what) {
 }
 
 
+
+
+// Doctor diagnoses ordinary drift against independently fetched merged source.
+// User-owned launcher+pin replacement is deliberately a same-user residual.
+(function installationDoctor() {
+  const pinPath = () => path.join(SHIM(), 'launcher-pins.json');
+  const recordPath = path.join(DIR, 'installation.json');
+  const sha = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+  const state = () => {
+    const out = {};
+    const walk = (dir) => { for (const n of listOr(dir)) {
+      const p = path.join(dir, n); const st = fs.lstatSync(p);
+      if (st.isDirectory()) walk(p);
+      else out[path.relative(ROOT, p)] = { mode: st.mode & 0o777,
+        bytes: st.isSymbolicLink() ? fs.readlinkSync(p) : sha(p) };
+    } };
+    if (fs.existsSync(ROOT)) walk(ROOT);
+    return JSON.stringify(out);
+  };
+  const setup = () => {
+    fresh(); canonTest('head');
+    const r = agentEnv();
+    const emittedState = fs.existsSync(pinPath()) && fs.existsSync(recordPath);
+    // Legacy source supplies no metadata; seed the same harmless fixture so
+    // the pre-feature RED run still drives the actual diagnostic entry point.
+    if (!fs.existsSync(pinPath())) fs.writeFileSync(pinPath(), JSON.stringify({ gh: sha(path.join(SHIM(), 'bin', 'gh')),
+      'mm-gh-org': sha(path.join(SHIM(), 'bin', 'mm-gh-org')) }), { mode: 0o600 });
+    if (!fs.existsSync(recordPath)) fs.writeFileSync(recordPath, JSON.stringify({ version: 1, profile: NAME, commit: COMMIT,
+      real_gh: REAL_GH_CANON }), { mode: 0o600 });
+    return { result: r, emittedState };
+  };
+  const probe = (name, reason) => {
+    for (const f of [curlLog, ghLog, brewLog]) fs.writeFileSync(f, '');
+    const before = state();
+    const scratchBefore = listOr(root).filter((n) => n.startsWith('identity-doctor.')).join(',');
+    const refsBefore = git(src, 'show-ref');
+    const r = run([path.join(IDENTITY, 'agent-env.sh'), 'doctor', NAME]);
+    ok(`doctor ${name}: typed ${reason}`, (reason === 'Ok' ? r.status === 0 : r.status !== 0)
+      && r.stdout === `agent-env doctor: ${reason}\n` && r.stderr === '', `status=${r.status}`);
+    ok(`doctor ${name}: installed env/launchers/pins/record unchanged and no owner-gh/mint/API/token exposure`,
+      before === state() && refsBefore === git(src, 'show-ref') && scratchBefore === listOr(root).filter((n) => n.startsWith('identity-doctor.')).join(',') && ghRuns().length === 0 && records(curlLog).length === 0 && readOr(brewLog) === ''
+        && ![OWNER, PKG, 'ghs_T1'].some((t) => (r.stdout + r.stderr).includes(t)), '');
+  };
+  const installed = setup();
+  ok('installer emits doctor metadata and launcher pins without fixture fallback', installed.result.status === 0 && installed.emittedState, '');
+  probe('canonical merged installation', 'Ok');
+  for (const launcher of ['gh', 'mm-gh-org']) {
+    setup();
+    const file = path.join(SHIM(), 'bin', launcher);
+    const oldHash = sha(file);
+    fs.appendFileSync(file, '\n# joint user-owned launcher and pin modification\n');
+    const pins = JSON.parse(readOr(pinPath())); pins[launcher] = sha(file);
+    fs.writeFileSync(pinPath(), JSON.stringify(pins));
+    // On the legacy R2 representation the pin is embedded in env; replacing
+    // it too proves exactly the settled residual before the doctor exists.
+    fs.writeFileSync(path.join(DIR, 'env'), readOr(path.join(DIR, 'env')).replace(oldHash, pins[launcher]));
+    const accepted = run(['-c', 'source "$1" && echo accepted', '_', path.join(DIR, 'env')]);
+    ok(`same-user joint ${launcher}+pin replacement intentionally passes saved env`, accepted.status === 0 && /accepted/.test(accepted.stdout), '');
+    probe(`joint ${launcher}+pin modification`, 'CanonicalMismatch');
+    setup(); fs.appendFileSync(path.join(SHIM(), 'bin', launcher), '\n# launcher only\n');
+    probe(`modified ${launcher}`, 'CanonicalMismatch');
+    setup(); fs.rmSync(path.join(SHIM(), 'bin', launcher));
+    probe(`missing ${launcher}`, 'LauncherMissing');
+    setup(); const changed = JSON.parse(readOr(pinPath())); changed[launcher] = '0'.repeat(64);
+    fs.writeFileSync(pinPath(), JSON.stringify(changed)); probe(`changed ${launcher} pin`, 'CanonicalMismatch');
+  }
+
+  // The pin-file representation retains fail-closed acceptance on every
+  // source, including wrong shape/type and a same-bytes symlink.
+  for (const damage of ['missing', 'malformed JSON', 'extra key', 'matching symlink']) {
+    setup();
+    if (damage === 'missing') fs.rmSync(pinPath());
+    else if (damage === 'malformed JSON') fs.writeFileSync(pinPath(), '{');
+    else if (damage === 'extra key') {
+      const pins = JSON.parse(readOr(pinPath())); pins.extra = pins.gh;
+      fs.writeFileSync(pinPath(), JSON.stringify(pins));
+    } else {
+      const outside = path.join(root, 'matching-pins.json');
+      fs.copyFileSync(pinPath(), outside); fs.rmSync(pinPath()); fs.symlinkSync(outside, pinPath());
+    }
+    for (const f of [curlLog, ghLog, brewLog]) fs.writeFileSync(f, '');
+    const caller = path.join(root, 'pin-source-caller'); fs.rmSync(caller, { force: true });
+    const r = run(['-c', `source "$1" && { echo caller > ${JSON.stringify(caller)}; gh api guarded; }`, '_', path.join(DIR, 'env')]);
+    ok(`saved env refuses ${damage} pins before caller/owner-gh/mint/API`,
+      r.status !== 0 && !fs.existsSync(caller) && ghRuns().length === 0 && records(curlLog).length === 0 && readOr(brewLog) === '', '');
+  }
+
+  setup(); fs.rmSync(pinPath()); probe('missing pins', 'PinsMissing');
+  setup(); fs.writeFileSync(pinPath(), '{}'); probe('malformed pins', 'PinsInvalid');
+  setup(); fs.rmSync(recordPath); probe('missing installation record', 'InstallationRecordMissing');
+  for (const [field, value] of [['version', '1'], ['profile', 'mm-other'], ['commit', '../untrusted'], ['real_gh', 'relative-gh']]) {
+    setup(); const record = JSON.parse(readOr(recordPath)); record[field] = value;
+    fs.writeFileSync(recordPath, JSON.stringify(record)); probe(`invalid record ${field}`, 'InstallationRecordInvalid');
+  }
+  setup(); fs.writeFileSync(path.join(DIR, 'env'), readOr(path.join(DIR, 'env')).replace(COMMIT, '0'.repeat(40)));
+  probe('record/env commit mismatch', 'InstallationRecordInvalid');
+  setup(); canonTest('gone'); probe('canonical source unavailable', 'SourceUnavailable'); canonTest('head');
+  setup(); canonTest('elsewhere'); probe('recorded source not merged', 'SourceNotMerged'); canonTest('head');
+
+  const helper = path.join(IDENTITY, 'launcher-render.sh');
+  if (fs.existsSync(helper)) {
+    setup(); const original = fs.readFileSync(helper);
+    fs.writeFileSync(helper, '#!/bin/bash\nexit 91\n');
+    probe('dirty caller working-tree generator ignored', 'Ok'); fs.writeFileSync(helper, original);
+    // A real merged fixture commit lacking the generator is unsupported. The
+    // doctor must not run that version's full installer as a fallback.
+    setup(); git(src, 'rm', '-q', 'governance/identity/launcher-render.sh');
+    git(src, 'commit', '-q', '-m', 'legacy fixture without generator');
+    const legacy = git(src, 'rev-parse', 'HEAD'); git(src, 'push', '-q', canon, 'HEAD:refs/heads/test');
+    fs.cpSync(SHIM(), SHIM(legacy), { recursive: true });
+    const record = JSON.parse(readOr(recordPath)); record.commit = legacy;
+    fs.writeFileSync(recordPath, JSON.stringify(record));
+    fs.writeFileSync(path.join(DIR, 'env'), readOr(path.join(DIR, 'env')).replace(COMMIT, legacy));
+    probe('legacy merged source lacking pure generator', 'SourceUnavailable');
+    git(src, 'reset', '-q', '--hard', COMMIT); canonTest('head');
+  }
+})();
 
 // The saved per-command environment must trust canonical install-time bytes,
 // not merely any executable currently found at either launcher path.
@@ -878,6 +995,7 @@ function zshOrSkip(what) {
   for (const [what, dirty] of [
     ['an uncommitted change to gh-shim.sh', () => fs.appendFileSync(path.join(IDENTITY, 'gh-shim.sh'), '# local\n')],
     ['an uncommitted change to app-token.sh', () => fs.appendFileSync(path.join(IDENTITY, 'app-token.sh'), '# local\n')],
+    ['an uncommitted change to launcher-render.sh', () => fs.appendFileSync(path.join(IDENTITY, 'launcher-render.sh'), '# local\n')],
     ['an uncommitted change to agent-env.sh', () => fs.appendFileSync(path.join(IDENTITY, 'agent-env.sh'), '# local\n')],
     ['a change hidden by git update-index --assume-unchanged', () => {
       git(src, 'update-index', '--assume-unchanged', rel('gh-shim.sh'));
@@ -1023,7 +1141,8 @@ function zshOrSkip(what) {
   canonTest('elsewhere');
   r = agentEnv();
   canonTest('head');
-  ok('the remembered answer names the three blobs that were checked', named.length === 3 && named.every((l) => /^[0-9a-f]{40}$/.test(l)), JSON.stringify(named));
+  const expectedBlobs = SCRIPTS.filter((f) => f !== 'provenance.sh').map((f) => git(src, 'rev-parse', `${COMMIT}:governance/identity/${f}`));
+  ok('the remembered answer names every verified installer input exactly', JSON.stringify(named) === JSON.stringify(expectedBlobs), JSON.stringify(named));
   ok('a remembered answer that names no blobs is not trusted: asked again, warned, no env file',
     r.status === 0 && /not on marvinamiranda\/\.github test/.test(r.stderr) && !fs.existsSync(ENV_FILE), `status ${r.status} env=${fs.existsSync(ENV_FILE)}`);
 })();
