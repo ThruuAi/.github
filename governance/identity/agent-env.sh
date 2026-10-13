@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # Install, or refresh, an agent identity, and print its environment for `eval`
 # (DELIVERY Appendix A). From a checkout of a merged commit, by the script's
 # absolute path, and never without `|| echo false`: a bare `eval "$(...)"` of a
@@ -65,7 +66,7 @@
 #                   prompting when it cannot.
 #
 # The copies are what every gh and git call runs, so they come from a commit,
-# never a working tree: it refuses a checkout whose three identity scripts
+# never a working tree: it refuses a checkout whose identity scripts, including launcher-render.sh,
 # differ from its HEAD commit (a change hidden from `git status` included), and
 # warns when that commit is not on marvinamiranda/.github test. Each commit gets
 # its own directory. Which one a shell runs depends on the form:
@@ -83,10 +84,7 @@
 # makes the eval fail. A script that cannot run at all prints nothing, which
 # is what `|| echo false` is for. A failed run leaves the env file as it was.
 #
-# This is a strong default, not a sandbox. Agents run on the owner's machine,
-# under the owner's user, and the owner's keyring login is one absolute path
-# away (`/opt/homebrew/bin/gh auth token --user <owner>`). The rulesets are the
-# backstop (DELIVERY §9).
+# Threat scope and same-user residual: README.md, "Identity integrity and doctor".
 set -euo pipefail
 
 ROOT="$HOME/.config/mm-agent"
@@ -234,9 +232,96 @@ write_zdotdir() {
   { mkdir -p "$1" && chmod 700 "$1"; } || return 1
   reassert_zsh "$2" "$3" | install_file "$1/reassert.zsh" 600 || return 1
   for f in .zshenv .zprofile .zshrc .zlogin .zlogout; do
-    startup_zsh "$f" "$1" | install_file "$1/$f" 600 || return 1
+    startup_zsh "$f" "${4:-$1}" | install_file "$1/$f" 600 || return 1
   done
 }
+
+# Read-only diagnostic: trusted public source is fetched only into disposable
+# scratch, and only its pure renderer runs; never an installed env/launcher.
+doctor_cleanup() {
+  if [[ -n "${DOCTOR_SCRATCH:-}" ]]; then rm -rf -- "$DOCTOR_SCRATCH"; fi
+}
+doctor_fail() { printf 'agent-env doctor: %s\n' "$1"; exit 1; }
+doctor() {
+  [[ $# -eq 2 ]] || doctor_fail Usage
+  local profile="$2" dir record values revision real scratch_base scratch repo f reason top
+  case "$profile" in mm-agent | mm-reviewer) ;; *) doctor_fail Usage ;; esac
+  dir="$ROOT/$profile"
+  record="$dir/installation.json"
+  [[ -f "$record" && ! -L "$record" && -r "$record" ]] || doctor_fail InstallationRecordMissing
+  [[ -r "$HERE/provenance.sh" ]] || doctor_fail SourceUnavailable
+  # shellcheck source=provenance.sh
+  . "$HERE/provenance.sh"
+  top="$(mm_provenance_top "$HERE")" || top=""
+  MM_PROVENANCE_PATH="$(mm_provenance_safe_path "$top")"
+  local PATH="$MM_PROVENANCE_PATH"
+  values="$(mm_run python3 -I -S - "$record" "$dir/env" "$profile" 2>/dev/null <<'PY_DOCTOR_RECORD'
+import json, os, re, stat, sys
+try:
+    r = json.load(open(sys.argv[1]))
+    if not isinstance(r, dict) or set(r) != {'version', 'profile', 'commit', 'real_gh'}:
+        sys.exit(1)
+    if type(r['version']) is not int or r['version'] != 1 or r['profile'] != sys.argv[3]:
+        sys.exit(1)
+    if not isinstance(r['commit'], str) or not re.fullmatch('[0-9a-f]{40}', r['commit']):
+        sys.exit(1)
+    real = r['real_gh']
+    if not isinstance(real, str) or not os.path.isabs(real) or any(ord(c) < 32 or ord(c) == 127 for c in real):
+        sys.exit(1)
+    if not stat.S_ISREG(os.lstat(sys.argv[2]).st_mode):
+        sys.exit(1)
+    commits = re.findall(r'^# commit: ([0-9a-f]{40})$', open(sys.argv[2]).read(), re.M)
+    if commits != [r['commit']]:
+        sys.exit(1)
+    print(r['commit']); print(real)
+except (OSError, ValueError, TypeError):
+    sys.exit(1)
+PY_DOCTOR_RECORD
+)" || doctor_fail InstallationRecordInvalid
+  { IFS= read -r revision && IFS= read -r real; } <<<"$values" || doctor_fail InstallationRecordInvalid
+  local shim="$dir/shim/$revision" pins="$dir/shim/$revision/launcher-pins.json"
+  [[ -f "$pins" && ! -L "$pins" && -r "$pins" ]] || doctor_fail PinsMissing
+  scratch_base="${TMPDIR:-$HOME/repo/_work}"
+  [[ "$scratch_base" == /* && -d "$scratch_base" ]] || doctor_fail ScratchUnavailable
+  scratch="$(mktemp -d "$scratch_base/identity-doctor.XXXXXX" 2>/dev/null)" || doctor_fail ScratchUnavailable
+  DOCTOR_SCRATCH="$scratch"
+  trap doctor_cleanup EXIT
+  repo="$scratch/canonical.git"
+  PROVENANCE_PROBLEM="" PROVENANCE_TEST=""
+  MM_PROVENANCE_TIMEOUT=30 mm_provenance_fetch "$repo"
+  [[ -z "$PROVENANCE_PROBLEM" ]] || doctor_fail SourceUnavailable
+  if ! mm_scratch_git "$repo" cat-file -e "$revision^{commit}" 2>/dev/null \
+      || ! mm_scratch_git "$repo" merge-base --is-ancestor "$revision" "$PROVENANCE_TEST" 2>/dev/null; then
+    doctor_fail SourceNotMerged
+  fi
+  mm_scratch_git "$repo" cat-file blob "$revision:governance/identity/launcher-render.sh" >"$scratch/launcher-render.sh" 2>/dev/null \
+    || doctor_fail SourceUnavailable
+  for f in gh mm-gh-org; do
+    mm_run bash "$scratch/launcher-render.sh" "$f" "$profile" "$revision" "$real" "$ROOT" >"$scratch/$f" 2>/dev/null \
+      || doctor_fail SourceUnavailable
+  done
+  reason="$(mm_run python3 -I -S - "$pins" "$scratch/gh" "$scratch/mm-gh-org" "$shim/bin/gh" "$shim/bin/mm-gh-org" 2>/dev/null <<'PY_DOCTOR_COMPARE'
+import hashlib, json, os, re, stat, sys
+try:
+    pins = json.load(open(sys.argv[1]))
+    if not isinstance(pins, dict) or set(pins) != {'gh', 'mm-gh-org'} or any(not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v) for v in pins.values()):
+        print('PinsInvalid'); sys.exit(0)
+    canonical_hashes = [hashlib.sha256(open(p, 'rb').read()).hexdigest() for p in sys.argv[2:4]]
+    for path, key, expected in zip(sys.argv[4:6], ['gh', 'mm-gh-org'], canonical_hashes):
+        if not stat.S_ISREG(os.lstat(path).st_mode) or not os.access(path, os.X_OK):
+            print('LauncherMissing'); sys.exit(0)
+        if hashlib.sha256(open(path, 'rb').read()).hexdigest() != expected or pins[key] != expected:
+            print('CanonicalMismatch'); sys.exit(0)
+    print('Ok')
+except (OSError, ValueError, TypeError):
+    print('LauncherMissing' if any(not os.path.isfile(p) for p in sys.argv[4:6]) else 'PinsInvalid')
+PY_DOCTOR_COMPARE
+)" || doctor_fail SourceUnavailable
+  case "$reason" in Ok | PinsInvalid | LauncherMissing | CanonicalMismatch) ;; *) doctor_fail SourceUnavailable ;; esac
+  [[ "$reason" == Ok ]] || doctor_fail "$reason"
+  printf 'agent-env doctor: Ok\n'
+}
+if [[ "${1:-}" == doctor ]]; then doctor "$@"; exit 0; fi
 
 PRINTED=0
 STAGE="" # the private directory the scripts are read into; removed on exit
@@ -300,7 +385,7 @@ DIR="$ROOT/$NAME"
 APP_JSON="$DIR/app.json"
 GH_DIR="$DIR/gh"
 [[ -r "$APP_JSON" ]] || locked "missing $APP_JSON; the owner creates it with python3 -I -S governance/identity/create-app.py $NAME"
-[[ -x "$HERE/gh-shim.sh" && -x "$HERE/app-token.sh" && -r "$HERE/provenance.sh" ]] || locked "gh-shim.sh, app-token.sh or provenance.sh is missing beside $0"
+[[ -x "$HERE/gh-shim.sh" && -x "$HERE/app-token.sh" && -r "$HERE/provenance.sh" && -r "$HERE/launcher-render.sh" ]] || locked "gh-shim.sh, app-token.sh, provenance.sh or launcher-render.sh is missing beside $0"
 [[ -n "$real_gh" ]] || locked "no gh on PATH"
 command -v git >/dev/null || locked "git is required"
 
@@ -308,11 +393,11 @@ command -v git >/dev/null || locked "git is required"
 # checkout: anything that can write under its .git could make git run code
 # there (core.fsmonitor, a clean filter) or read other content under a real
 # object id (provenance.sh says how). HEAD's id is read from its files; the
-# three scripts are read once, into a private directory, and those bytes are
+# identity scripts are read once, into a private directory, and those bytes are
 # what is hashed, compared with the commit, installed, and checked against
 # marvinamiranda/.github test below. So a change hidden from `git status`
 # (update-index --assume-unchanged) is refused too.
-# shellcheck source=provenance.sh disable=SC1091
+# shellcheck source=provenance.sh
 . "$HERE/provenance.sh"
 top="$(mm_provenance_top "$HERE")" \
   || locked "$HERE is not in a git checkout with a commit, so what it would install cannot be tied to one. Eval from a clone of marvinamiranda/.github."
@@ -327,7 +412,7 @@ prefix="${prefix#"$top"}"
 prefix="${prefix#/}"
 [[ -z "$prefix" ]] || prefix="$prefix/"
 STAGE="$(mktemp -d "$DIR/.stage.XXXXXX")" || locked "cannot make a private directory under $DIR"
-SCRIPT_FILES=(agent-env.sh gh-shim.sh app-token.sh)
+SCRIPT_FILES=(agent-env.sh gh-shim.sh app-token.sh launcher-render.sh)
 for f in "${SCRIPT_FILES[@]}"; do
   mm_run cat -- "$HERE/$f" >"$STAGE/$f" 2>/dev/null || locked "cannot read the scripts in $HERE"
 done
@@ -346,8 +431,8 @@ for f in "${SCRIPT_FILES[@]}"; do
   blob="$(mm_scratch_git "$local_repo" hash-object --no-filters --stdin <"$STAGE/$f")" || locked "cannot hash the scripts in $HERE"
   have="${have:+$have$'\n'}$blob"
 done
-want="$(mm_scratch_git "$local_repo" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" 2>/dev/null)" \
-  || locked "agent-env.sh, gh-shim.sh and app-token.sh are not all in commit ${commit:0:12}. Eval from a clean checkout of a merged commit."
+want="$(mm_scratch_git "$local_repo" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" "$commit:${prefix}launcher-render.sh" 2>/dev/null)" \
+  || locked "agent-env.sh, gh-shim.sh, app-token.sh and launcher-render.sh are not all in commit ${commit:0:12}. Eval from a clean checkout of a merged commit."
 [[ "$have" == "$want" ]] \
   || locked "a script in $HERE differs from commit ${commit:0:12} (uncommitted changes, or ones hidden from git status). Commit or discard them, or eval from a clean checkout of a merged commit."
 
@@ -435,35 +520,53 @@ PY
   fi
 fi
 
-# The launcher, the only file in the directory PATH gets, so the helpers stay
-# off PATH; it execs the copy, and never falls through to the real gh. Then the
-# zsh startup files. Rewritten whenever what they hold changes, or one is
-# missing; the stamp that says they are current is written last.
+# Generate canonical launchers and zsh files from the verified source before
+# comparing the installed artifacts. A surviving stamp cannot vouch for their
+# current bytes or modes. Each replacement remains atomic; stamp written last.
 body="$(body_lines "$GH_DIR" "$ZD" "$bot" "$email" "$helper" "$real_gh")"
 stamp="$real_gh"$'\n'"$body"
-current=1
-for f in "$BIN/gh" "$BIN/mm-gh-org" "$ZD/reassert.zsh" "$ZD/.zshenv" "$ZD/.zprofile" "$ZD/.zshrc" "$ZD/.zlogin" "$ZD/.zlogout" "$SHIM/.installed"; do
-  [[ -e "$f" ]] || current=0
+generated="$STAGE/generated"
+mkdir -p "$generated/bin" || locked "cannot stage generated launchers"
+# The generator bytes were staged and verified with the installer inputs.
+# shellcheck source=launcher-render.sh
+. "$STAGE/launcher-render.sh"
+for f in gh mm-gh-org; do
+  mm_render_launcher "$f" "$NAME" "$commit" "$real_gh" "$ROOT" >"$generated/bin/$f" || locked "cannot stage launcher"
 done
-if [[ $current -eq 0 || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
-  { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
-    printf 'unset MM_GH_ORG\nexec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
-  } | install_file "$BIN/gh" 700 || locked "cannot write $BIN/gh"
-  # mm-gh-org <org> <gh arguments...>: the same gh, with that org's token.
-  { printf '#!/usr/bin/env bash\n# Written by agent-env.sh from commit %s.\n' "$commit"
-    # shellcheck disable=SC2016 # literal text for the generated script
-    printf 'org="${1:-}"; case "$org" in marvinamiranda | ThruuAi) ;; *) echo "usage: mm-gh-org <marvinamiranda|ThruuAi> <gh arguments...>" >&2; exit 2 ;; esac\nshift\n'
-    # shellcheck disable=SC2016 # literal text for the generated script
-    printf 'MM_GH_ORG="$org" exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
-  } | install_file "$BIN/mm-gh-org" 700 || locked "cannot write $BIN/mm-gh-org"
-  write_zdotdir "$ZD" "$BIN" "$body" || locked "cannot write the zsh startup files in $ZD"
+# Pin the canonical staged bytes, never the currently installed launcher bytes.
+launcher_hashes="$(python3 -I -S - "$generated/bin/gh" "$generated/bin/mm-gh-org" 2>/dev/null <<'PY_HASH_CANONICAL'
+import hashlib, sys
+print(" ".join(hashlib.sha256(open(path, "rb").read()).hexdigest() for path in sys.argv[1:]))
+PY_HASH_CANONICAL
+)" || locked "cannot hash canonical launchers"
+read -r gh_launcher_sha org_launcher_sha <<<"$launcher_hashes"
+python3 -I -S - "$gh_launcher_sha" "$org_launcher_sha" >"$STAGE/launcher-pins.json" <<'PY_WRITE_PINS'
+import json, sys
+print(json.dumps({'gh': sys.argv[1], 'mm-gh-org': sys.argv[2]}, sort_keys=True))
+PY_WRITE_PINS
+PIN_FILE="$SHIM/launcher-pins.json"
+write_zdotdir "$generated/zdotdir" "$BIN" "$body" "$ZD" || locked "cannot stage zsh startup files"
+{ mkdir -p "$ZD" && chmod 700 "$ZD"; } || locked "cannot create $ZD"
+GENERATED_FILES=(bin/gh bin/mm-gh-org zdotdir/reassert.zsh zdotdir/.zshenv zdotdir/.zprofile zdotdir/.zshrc zdotdir/.zlogin zdotdir/.zlogout)
+for f in "${GENERATED_FILES[@]}"; do
+  mode=600
+  executable=0
+  if [[ "$f" == bin/* ]]; then mode=700; executable=1; fi
+  if [[ ! -f "$SHIM/$f" || -L "$SHIM/$f" || ! -r "$SHIM/$f" ]] \
+      || { [[ "$executable" -eq 1 ]] && [[ ! -x "$SHIM/$f" ]]; } \
+      || ! cmp -s "$generated/$f" "$SHIM/$f"; then
+    install_file "$SHIM/$f" "$mode" <"$generated/$f" || locked "cannot write $SHIM/$f"
+  fi
+done
+install_file "$PIN_FILE" 600 <"$STAGE/launcher-pins.json" || locked "cannot write launcher pins"
+if [[ ! -f "$SHIM/.installed" || "$(<"$SHIM/.installed")" != "$stamp" ]]; then
   printf '%s\n' "$stamp" | install_file "$SHIM/.installed" 600 || locked "cannot write $SHIM/.installed"
 fi
 
 # Is that commit on marvinamiranda/.github test, as GitHub has it now (its
 # canonical URL, fetched as bootstrap.sh fetches it, into a repository of this
 # script's), and are the copies its files there? "Yes" is remembered, as the
-# three blob ids that were checked: a commit on test stays there, since the
+# source blob ids that were checked: a commit on test stays there, since the
 # test-integration ruleset forbids force pushes, and the copies are only
 # trusted while they are those blobs. Any other answer is asked again at the
 # next eval, which is cheap enough now that an eval only installs or refreshes
@@ -479,7 +582,7 @@ provenance() {
   elif ! mm_scratch_git "$repo" cat-file -e "$commit^{commit}" 2>/dev/null \
       || ! mm_scratch_git "$repo" merge-base --is-ancestor "$commit" "$PROVENANCE_TEST" 2>/dev/null; then
     echo "commit ${commit:0:12} is not on marvinamiranda/.github test (${PROVENANCE_TEST:0:12}): it has not been merged"
-  elif ! blobs="$(mm_scratch_git "$repo" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" 2>/dev/null)" \
+  elif ! blobs="$(mm_scratch_git "$repo" rev-parse "$commit:${prefix}agent-env.sh" "$commit:${prefix}gh-shim.sh" "$commit:${prefix}app-token.sh" "$commit:${prefix}launcher-render.sh" 2>/dev/null)" \
       || [[ "$blobs" != "$have" ]]; then
     echo "the scripts in $HERE are not the ones commit ${commit:0:12} holds on marvinamiranda/.github test"
   else
@@ -515,7 +618,27 @@ env_script() {
 # missing file, or a missing shim, stops the command:
 #   . ~/.config/mm-agent/$NAME/env && gh pr create ...
 # commit: $commit
-if [ -x $(q "$BIN/gh") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ]; then
+# Both canonical launcher hashes were pinned by the installer. Every source
+# verifies the current regular executable pair before making identity usable.
+if [ -x $(q "$BIN/gh") ] && [ -x $(q "$BIN/mm-gh-org") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ] && \
+python3 -I -S - $(q "$BIN/gh") $(q "$BIN/mm-gh-org") $(q "$PIN_FILE") 2>/dev/null <<'MM_AGENT_LAUNCHER_HASHES'
+import hashlib, json, os, re, stat, sys
+try:
+    pin_path = sys.argv[3]
+    if not stat.S_ISREG(os.lstat(pin_path).st_mode):
+        sys.exit(1)
+    pins = json.load(open(pin_path))
+    if not isinstance(pins, dict) or set(pins) != {'gh', 'mm-gh-org'} or any(not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v) for v in pins.values()):
+        sys.exit(1)
+    for path, expected in zip(sys.argv[1:3], [pins['gh'], pins['mm-gh-org']]):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            sys.exit(1)
+        if hashlib.sha256(open(path, "rb").read()).hexdigest() != expected:
+            sys.exit(1)
+except (OSError, ValueError, TypeError):
+    sys.exit(1)
+MM_AGENT_LAUNCHER_HASHES
+then
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
 ${packages_line:-: no packages token}
@@ -523,7 +646,7 @@ $(owner_zdotdir_lines)
 $body
 $(path_lines "$BIN")
 else
-echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is gone ($SHIM); nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
+echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is missing or changed ($SHIM); nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
 unset MM_REAL_GH_BIN
 GH_TOKEN=$(q "$SENTINEL"); export GH_TOKEN
 false
@@ -533,8 +656,15 @@ EOF
 script="$(env_script)"
 ENV_FILE="$DIR/env"
 if [[ $on_test -eq 1 ]]; then
-  printf '%s\n' "$script" | install_file "$ENV_FILE" 600 \
-    || echo "agent-env.sh: WARNING: $ENV_FILE could not be written; the per-command form still runs what it held." >&2
+  python3 -I -S - "$NAME" "$commit" "$real_gh" >"$STAGE/installation.json" <<'PY_INSTALL_RECORD'
+import json, sys
+print(json.dumps({'version': 1, 'profile': sys.argv[1], 'commit': sys.argv[2], 'real_gh': sys.argv[3]}, sort_keys=True))
+PY_INSTALL_RECORD
+  if printf '%s\n' "$script" | install_file "$ENV_FILE" 600; then
+    install_file "$DIR/installation.json" 600 <"$STAGE/installation.json" || locked "cannot write installation record"
+  else
+    echo "agent-env.sh: WARNING: $ENV_FILE could not be written; the per-command form still runs what it held." >&2
+  fi
 else
   was=""
   if [[ -r "$ENV_FILE" ]]; then was="$(sed -n 's/^# commit: //p' "$ENV_FILE" | head -1)" || was=""; fi
