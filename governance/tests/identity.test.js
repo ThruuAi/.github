@@ -319,6 +319,66 @@ function zshOrSkip(what) {
 }
 
 
+
+// The saved per-command environment must trust canonical install-time bytes,
+// not merely any executable currently found at either launcher path.
+(function savedLauncherIntegrity() {
+  const secrets = [OWNER, PKG, 'ghs_T1', 'ghs_GUARD_THRUU'];
+  const setup = () => {
+    fresh(); canonTest('head');
+    const scenario = JSON.parse(readOr(scenarioFile));
+    scenario[`GET ${API}/orgs/ThruuAi/installation`] = { status: 200, body: { id: 43 } };
+    scenario[`POST ${API}/app/installations/43/access_tokens`] = minted('ghs_GUARD_THRUU');
+    fs.writeFileSync(scenarioFile, JSON.stringify(scenario));
+    const installed = agentEnv();
+    ok('saved launcher integrity fixture installs from canonical source', installed.status === 0, '');
+    return path.join(DIR, 'env');
+  };
+  const clearCalls = () => {
+    for (const f of [curlLog, ghLog, brewLog]) fs.writeFileSync(f, '');
+    for (const f of [CACHE, `${CACHE}.thruuai`]) fs.rmSync(f, { force: true });
+  };
+  const invoke = (saved, command, extra = {}) => run(['-c', `source "$1" && ${command}`, '_', saved], extra);
+  let saved = setup();
+  for (const [command, token] of [['gh api canonical', 'ghs_T1'], ['mm-gh-org marvinamiranda api canonical', 'ghs_T1'],
+    ['mm-gh-org ThruuAi api canonical', 'ghs_GUARD_THRUU']]) {
+    clearCalls();
+    const r = invoke(saved, command, { FAKE_REAL_GH_EXIT: '29' });
+    const runs = ghRuns();
+    ok(`untouched saved launcher pair preserves ${command} token environment and exit 29`,
+      r.status === 29 && runs.length === 1 && runs[0].token === token && readOr(brewLog) === '', '');
+    ok(`untouched saved launcher pair exposes no sentinel output/argv for ${command}`,
+      !secrets.some((t) => (r.stdout + r.stderr).includes(t))
+        && runs.every((c) => !secrets.some((t) => c.args.join(' ').includes(t)))
+        && records(curlLog).every((c) => !/ghs_|eyJ/.test(c.argv.join(' '))), '');
+  }
+  for (const launcher of ['gh', 'mm-gh-org']) {
+    for (const damage of ['missing', 'tampered executable', 'owner fallback executable', 'matching symlink']) {
+      saved = setup();
+      const file = path.join(SHIM(), 'bin', launcher);
+      if (damage === 'missing') fs.rmSync(file);
+      else if (damage === 'tampered executable') fs.appendFileSync(file, '\n# executable bytes changed without reinstall\n');
+      else if (damage === 'owner fallback executable') {
+        fs.writeFileSync(file, `#!/usr/bin/env bash\nunset GH_TOKEN GH_CONFIG_DIR\nexec ${JSON.stringify(path.join(brewBin, 'gh'))} api owner-fallback\n`, { mode: 0o700 });
+      } else {
+        const external = path.join(root, 'matching-launcher');
+        fs.copyFileSync(file, external); fs.chmodSync(external, 0o700);
+        fs.rmSync(file); fs.symlinkSync(external, file);
+      }
+      const caller = path.join(root, 'guarded-caller-ran');
+      fs.rmSync(caller, { force: true }); clearCalls();
+      // No reinstall between damage and sourcing; caller marker is before
+      // invocation, so a rejected executable alone cannot satisfy this proof.
+      const command = `${launcher}${launcher === 'mm-gh-org' ? ' ThruuAi' : ''} api guarded`;
+      const r = invoke(saved, `{ echo caller > ${JSON.stringify(caller)}; ${command}; }`);
+      ok(`saved env refuses ${damage} ${launcher} without reinstall before caller/owner-gh/mint/API/gh`,
+        r.status !== 0 && !fs.existsSync(caller) && readOr(brewLog) === '' && ghRuns().length === 0 && records(curlLog).length === 0, '');
+      ok(`saved env refusal for ${damage} ${launcher} prints no sentinel credentials`,
+        !secrets.some((t) => (r.stdout + r.stderr).includes(t)), '');
+    }
+  }
+})();
+
 // Reinstall regenerates trusted routing from the committed source, including
 // when an old stamp survives missing, corrupted or non-executable artifacts.
 (function installedLifecycle() {

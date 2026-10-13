@@ -452,6 +452,13 @@ mkdir -p "$generated/bin" || locked "cannot stage generated launchers"
   # shellcheck disable=SC2016 # literal text for the generated script
   printf 'MM_GH_ORG="$org" exec %s %s %s "$@"\n' "$(q "$LIBEXEC/gh-shim.sh")" "$(q "$NAME")" "$(q "$real_gh")"
 } >"$generated/bin/mm-gh-org" || locked "cannot stage mm-gh-org launcher"
+# Pin the canonical staged bytes, never the currently installed launcher bytes.
+launcher_hashes="$(python3 -I -S - "$generated/bin/gh" "$generated/bin/mm-gh-org" 2>/dev/null <<'PY_HASH_CANONICAL'
+import hashlib, sys
+print(" ".join(hashlib.sha256(open(path, "rb").read()).hexdigest() for path in sys.argv[1:]))
+PY_HASH_CANONICAL
+)" || locked "cannot hash canonical launchers"
+read -r gh_launcher_sha org_launcher_sha <<<"$launcher_hashes"
 write_zdotdir "$generated/zdotdir" "$BIN" "$body" "$ZD" || locked "cannot stage zsh startup files"
 { mkdir -p "$ZD" && chmod 700 "$ZD"; } || locked "cannot create $ZD"
 GENERATED_FILES=(bin/gh bin/mm-gh-org zdotdir/reassert.zsh zdotdir/.zshenv zdotdir/.zprofile zdotdir/.zshrc zdotdir/.zlogin zdotdir/.zlogout)
@@ -524,7 +531,21 @@ env_script() {
 # missing file, or a missing shim, stops the command:
 #   . ~/.config/mm-agent/$NAME/env && gh pr create ...
 # commit: $commit
-if [ -x $(q "$BIN/gh") ] && [ -x $(q "$BIN/mm-gh-org") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ]; then
+# Both canonical launcher hashes were pinned by the installer. Every source
+# verifies the current regular executable pair before making identity usable.
+if [ -x $(q "$BIN/gh") ] && [ -x $(q "$BIN/mm-gh-org") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ] && \
+python3 -I -S - $(q "$BIN/gh") $(q "$BIN/mm-gh-org") $(q "$gh_launcher_sha") $(q "$org_launcher_sha") 2>/dev/null <<'MM_AGENT_LAUNCHER_HASHES'
+import hashlib, os, stat, sys
+try:
+    for path, expected in zip(sys.argv[1:3], sys.argv[3:5]):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            sys.exit(1)
+        if hashlib.sha256(open(path, "rb").read()).hexdigest() != expected:
+            sys.exit(1)
+except OSError:
+    sys.exit(1)
+MM_AGENT_LAUNCHER_HASHES
+then
 unset GH_TOKEN GITHUB_TOKEN GH_PACKAGES_TOKEN
 unset -f gh 2>/dev/null || true; unalias gh 2>/dev/null || true
 ${packages_line:-: no packages token}
@@ -532,7 +553,7 @@ $(owner_zdotdir_lines)
 $body
 $(path_lines "$BIN")
 else
-echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is gone ($SHIM); nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
+echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is missing or changed ($SHIM); nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
 unset MM_REAL_GH_BIN
 GH_TOKEN=$(q "$SENTINEL"); export GH_TOKEN
 false
