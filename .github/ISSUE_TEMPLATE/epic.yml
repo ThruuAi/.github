@@ -54,6 +54,21 @@ body:
       required: true
 
   - type: textarea
+    id: how_to_test
+    attributes:
+      label: How to test
+      description: "Optional. The short script for a slice of this Epic that is ready to run, in the same shape as a Task's How to test. Leave empty when the Demo script above already covers it."
+      placeholder: |
+        1. Actor: ...
+        2. Entry point: ...
+        3. Setup: ...
+        4. Steps: ...
+        5. Expected result: ...
+        6. Negative path: ...
+    validations:
+      required: false
+
+  - type: textarea
     id: exit
     attributes:
       label: Exit criteria
