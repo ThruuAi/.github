@@ -99,6 +99,21 @@ body:
       required: true
 
   - type: textarea
+    id: how_to_test
+    attributes:
+      label: How to test
+      description: "The short script the owner runs on the test environment to see this slice working, without asking the builder. Cover the actor, the entry point (URL, screen, command or endpoint), the setup (data, roles, flags), the steps, the expected result, and a negative path (what must be refused, and what the person sees)."
+      placeholder: |
+        1. Actor: ...
+        2. Entry point: ...
+        3. Setup: ...
+        4. Steps: ...
+        5. Expected result: ...
+        6. Negative path: ...
+    validations:
+      required: true
+
+  - type: textarea
     id: tests
     attributes:
       label: Tests required
