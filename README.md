@@ -110,7 +110,7 @@ jobs:
   governance:
     # A full commit SHA of this repository, never a branch: the code that
     # judges a pull request must be a reviewed commit.
-    uses: marvinamiranda/.github/.github/workflows/pr-governance.yml@<40-char sha>
+    uses: ThruuAi/.github/.github/workflows/pr-governance.yml@<40-char sha>
     with:
       runs-on: '["self-hosted", "pool-linux"]'   # runners are self-hosted
       governance-ref: <the same sha>
@@ -133,7 +133,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   policy:
-    uses: marvinamiranda/.github/.github/workflows/source-policy.yml@<40-char sha>
+    uses: ThruuAi/.github/.github/workflows/source-policy.yml@<40-char sha>
     with:
       runs-on: '["self-hosted", "pool-linux"]'
       governance-ref: <the same sha>
@@ -241,7 +241,7 @@ file, so a pull request cannot edit the job that receives the key):
   issue-link:
     if: github.event.workflow_run.event == 'pull_request'
     permissions: { contents: read, issues: read, pull-requests: read }
-    uses: marvinamiranda/.github/.github/workflows/issue-link-publish.yml@<40-char sha>
+    uses: ThruuAi/.github/.github/workflows/issue-link-publish.yml@<40-char sha>
     with:
       runs-on: '["self-hosted", "gate-ephemeral"]'   # exactly this; see below
       governance-ref: <the same 40-char sha>

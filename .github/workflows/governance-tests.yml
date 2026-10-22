@@ -31,6 +31,8 @@ jobs:
         run: node governance/tests/source-policy.mutations.js
       - name: areas checker
         run: node governance/tests/areas-check.test.js
+      - name: governance pin anchors (ThruuAi/.github test), mutation proof
+        run: node governance/tests/pin-anchor.test.js
       - name: PR governance pin check
         run: node governance/tests/pr-governance.test.js
       - name: issue-link publisher (Checks App workflow)

@@ -32,7 +32,7 @@ const mutants = [
   ['checks: write granted to the job', ["      contents: read\n      issues: read\n      pull-requests: read\n    steps:", "      checks: write\n      contents: read\n      issues: read\n      pull-requests: read\n    steps:"]],
   ['the environment removed (the key is not released)', ["    environment:\n      name: governance-checks\n", "    environment:\n      name: other\n"]],
   ['deployment: false removed', ["      deployment: false\n", '']],
-  ['the pull request head checked out', ["          repository: marvinamiranda/.github\n          ref: ${{ inputs.governance-ref }}\n", "          ref: ${{ github.event.workflow_run.head_sha }}\n"]],
+  ['the pull request head checked out', ["          repository: ThruuAi/.github\n          ref: ${{ inputs.governance-ref }}\n", "          ref: ${{ github.event.workflow_run.head_sha }}\n"]],
   ['the caller repository checked out beside the matcher', ["      # Holds only the read GITHUB_TOKEN.", "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n        with:\n          persist-credentials: false\n\n      # Holds only the read GITHUB_TOKEN."]],
   ['a run: step added', ["      - name: Fetch the shared matcher\n", "      - name: Echo the title\n        run: echo \"${{ github.event.workflow_run.head_commit.message }}\"\n\n      - name: Fetch the shared matcher\n"]],
   ['an expression inside a script', ["const CAP = 60000;", "const CAP = ${{ github.event.workflow_run.id }};"]],

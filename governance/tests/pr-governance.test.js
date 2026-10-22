@@ -103,23 +103,29 @@ function fakeGitHub(status, branch = TEST_TIP) {
     } },
   };
 }
-const env = (o = {}) => ({ SELF_SHA: SHA, SELF_REPOSITORY: 'marvinamiranda/.github', GOVERNANCE_REF: SHA, ...o });
+const env = (o = {}) => ({ SELF_SHA: SHA, SELF_REPOSITORY: 'ThruuAi/.github', GOVERNANCE_REF: SHA, ...o });
 
 // [name, env, compare status or HTTP error, pass?, text the problem must contain, may compare?, getBranch answer]
 const cases = [
   ['the pin is test\'s head (identical): passes', env(), 'identical', true, '', true],
   ['the pin is an older commit of test (behind): passes', env(), 'behind', true, '', true],
-  ['the pin is ahead of test (an unmerged pull request commit): fails', env(), 'ahead', false, 'not on marvinamiranda/.github test', true],
-  ['the pin diverged from test (another branch, or a fork\'s commit): fails', env(), 'diverged', false, 'not on marvinamiranda/.github test', true],
+  ['the pin is ahead of test (an unmerged pull request commit): fails', env(), 'ahead', false, 'not on ThruuAi/.github test', true],
+  ['the pin diverged from test (another branch, or a fork\'s commit): fails', env(), 'diverged', false, 'not on ThruuAi/.github test', true],
   ['governance-ref names another commit than uses: fails, without asking GitHub', env({ GOVERNANCE_REF: OTHER }), 'identical', false, 'governance-ref', false],
   ['governance-ref is a branch name: fails', env({ GOVERNANCE_REF: 'test' }), 'identical', false, 'governance-ref', false],
   ['governance-ref is empty: fails', env({ GOVERNANCE_REF: '' }), 'identical', false, 'governance-ref', false],
   ['GitHub reports no workflow commit: fails closed', env({ SELF_SHA: '' }), 'identical', false, 'job.workflow_sha', false],
-  ['the workflow runs from a copy in another repository: fails', env({ SELF_REPOSITORY: 'someone/.github' }), 'identical', false, 'not marvinamiranda/.github', false],
+  ['the workflow runs from a copy in another repository: fails', env({ SELF_REPOSITORY: 'someone/.github' }), 'identical', false, 'not ThruuAi/.github', false],
+  // The home organisation moved (omni237#2629): the former root is no longer one.
+  ['the workflow runs from the former root, marvinamiranda/.github: fails, without asking GitHub', env({ SELF_REPOSITORY: 'marvinamiranda/.github' }), 'identical', false, 'not ThruuAi/.github', false],
+  ['the workflow runs from a lookalike, ThruuAi/.github-evil: fails', env({ SELF_REPOSITORY: 'ThruuAi/.github-evil' }), 'identical', false, 'not ThruuAi/.github', false],
+  ['the workflow runs from a fork of the root, someone/.github: fails', env({ SELF_REPOSITORY: 'someone/.github' }), 'identical', false, 'not ThruuAi/.github', false],
+  ['GitHub reports the repository in lower case: passes (the full name compares case-insensitively)', env({ SELF_REPOSITORY: 'thruuai/.github' }), 'identical', true, '', true],
+  ['no repository reported: fails closed', env({ SELF_REPOSITORY: '' }), 'identical', false, 'not ThruuAi/.github', false],
   ['the commit is unknown to GitHub (404): fails', env(), 404, false, 'HTTP 404', true],
   // R5: test is read as a branch, so a tag named test cannot stand in for it.
-  ['the branch test cannot be read (404): fails closed, without comparing', env(), 'identical', false, 'Could not read marvinamiranda/.github test', false, 404],
-  ['GitHub returns a branch without a commit: fails closed, without comparing', env(), 'identical', false, 'no commit for marvinamiranda/.github test', false, { name: 'test' }],
+  ['the branch test cannot be read (404): fails closed, without comparing', env(), 'identical', false, 'Could not read ThruuAi/.github test', false, 404],
+  ['GitHub returns a branch without a commit: fails closed, without comparing', env(), 'identical', false, 'no commit for ThruuAi/.github test', false, { name: 'test' }],
 ];
 
 (async () => {
@@ -134,10 +140,10 @@ const cases = [
     if (!mayCompare && gh.calls.length) issues.push('asked GitHub although the pin was already wrong');
     // The base of the compare is the sha the branch named test points at, never
     // the name "test", which a tag could shadow.
-    if (gh.calls.length && !(gh.calls[0].owner === 'marvinamiranda' && gh.calls[0].repo === '.github' && gh.calls[0].basehead === `${TEST_TIP}...${e.SELF_SHA}`)) {
+    if (gh.calls.length && !(gh.calls[0].owner === 'ThruuAi' && gh.calls[0].repo === '.github' && gh.calls[0].basehead === `${TEST_TIP}...${e.SELF_SHA}`)) {
       issues.push(`compared the wrong thing: ${JSON.stringify(gh.calls[0])}`);
     }
-    if (gh.calls.length && !(gh.branchCalls.length === 1 && gh.branchCalls[0].owner === 'marvinamiranda'
+    if (gh.calls.length && !(gh.branchCalls.length === 1 && gh.branchCalls[0].owner === 'ThruuAi'
         && gh.branchCalls[0].repo === '.github' && gh.branchCalls[0].branch === 'test')) {
       issues.push(`compared without reading the branch named test first: ${JSON.stringify(gh.branchCalls)}`);
     }
