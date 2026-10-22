@@ -101,8 +101,8 @@ ok('there is no run: step, so no shell', steps.every((s) => !('run' in s)));
 ok('no script carries a ${{ }} expression: everything reaches it as env or event data',
   steps.every((s) => !/\$\{\{/.test(script(s))), 'a ${{ }} expression sits inside a script');
 const checkouts = steps.filter((s) => /^actions\/checkout@/.test(s.uses || ''));
-ok('there is exactly one checkout, and it is of marvinamiranda/.github at governance-ref, not of the caller',
-  checkouts.length === 1 && checkouts[0].with.repository === 'marvinamiranda/.github'
+ok('there is exactly one checkout, and it is of ThruuAi/.github at governance-ref, not of the caller',
+  checkouts.length === 1 && checkouts[0].with.repository === 'ThruuAi/.github'
     && checkouts[0].with.ref === '${{ inputs.governance-ref }}' && checkouts[0].with.path === '.org-governance'
     && checkouts[0].with['persist-credentials'] === false, JSON.stringify(checkouts.map((c) => c.with)));
 ok('the checkout takes only governance/issue-link.js', checkouts[0] && checkouts[0].with['sparse-checkout'] === 'governance/issue-link.js');
@@ -289,11 +289,14 @@ async function failurePostedOnRunHead(github, result, failJobAfterPost = false) 
 // A fake for the pin step's own API calls (the same shape pr-governance's test uses).
 const TEST_TIP = '69b68cd158547974bb71b1fdc01ba7a89629c46c';
 const SELF = 'eded4bf1f05be3a33a354795bac37d77105bac16';
+// It knows only ThruuAi/.github: any other owner or repository answers 404, as
+// GitHub would for a repository the pin does not live in.
 function fakePinApi(status, branch = TEST_TIP) {
   const fail = (code) => { const e = new Error('HTTP error'); e.status = code; throw e; };
+  const root = (a) => { if (a.owner !== 'ThruuAi' || a.repo !== '.github') fail(404); };
   return { rest: { repos: {
-    getBranch: async (a) => { if (typeof branch === 'number') fail(branch); return { data: { name: a.branch, commit: { sha: branch } } }; },
-    compareCommitsWithBasehead: async () => { if (typeof status === 'number') fail(status); return { data: { status } }; },
+    getBranch: async (a) => { root(a); if (typeof branch === 'number') fail(branch); return { data: { name: a.branch, commit: { sha: branch } } }; },
+    compareCommitsWithBasehead: async (a) => { root(a); if (typeof status === 'number') fail(status); return { data: { status } }; },
   } } };
 }
 async function runPin(github, env) {
@@ -306,7 +309,7 @@ async function runPin(github, env) {
   if (!judgeStep || !post || !verify) { console.log('not ok - behaviour: the steps are missing'); process.exit(1); }
 
   // ---- the pin step's own script, call site included --------------------
-  const pinEnv = (o = {}) => ({ SELF_SHA: SELF, SELF_REPOSITORY: 'marvinamiranda/.github', GOVERNANCE_REF: SELF, ...o });
+  const pinEnv = (o = {}) => ({ SELF_SHA: SELF, SELF_REPOSITORY: 'ThruuAi/.github', GOVERNANCE_REF: SELF, ...o });
   for (const [label, github, env, pass] of [
     ['a pin that is test\'s head', fakePinApi('identical'), pinEnv(), true],
     ['a pin behind test', fakePinApi('behind'), pinEnv(), true],
@@ -314,6 +317,9 @@ async function runPin(github, env) {
     ['a pin that diverged from test (a fork or branch commit)', fakePinApi('diverged'), pinEnv(), false],
     ['a pin ahead of test (an unmerged commit)', fakePinApi('ahead'), pinEnv(), false],
     ['a workflow running from another repository', fakePinApi('identical'), pinEnv({ SELF_REPOSITORY: 'someone/.github' }), false],
+    ['a workflow running from the former root, marvinamiranda/.github', fakePinApi('identical'), pinEnv({ SELF_REPOSITORY: 'marvinamiranda/.github' }), false],
+    ['a workflow running from a lookalike, ThruuAi/.github-evil', fakePinApi('identical'), pinEnv({ SELF_REPOSITORY: 'ThruuAi/.github-evil' }), false],
+    ['a workflow reported in lower case, thruuai/.github', fakePinApi('identical'), pinEnv({ SELF_REPOSITORY: 'thruuai/.github' }), true],
     ['test that cannot be read', fakePinApi('identical', 404), pinEnv(), false],
   ]) {
     const core = await runPin(github, env);

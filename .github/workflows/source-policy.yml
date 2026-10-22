@@ -25,7 +25,7 @@
 # The caller pins this file by commit SHA and passes the same SHA as
 # governance-ref, exactly as pr-governance.yml: before the module is fetched,
 # governance-ref must equal job.workflow_sha and that commit must be on
-# marvinamiranda/.github test. The block below is the same verify-pin the other
+# ThruuAi/.github test. The block below is the same verify-pin the other
 # workflows run.
 name: Source policy
 
@@ -38,7 +38,7 @@ on:
         required: true
       governance-ref:
         description: >-
-          Commit SHA of marvinamiranda/.github whose governance/source-policy.js
+          Commit SHA of ThruuAi/.github whose governance/source-policy.js
           is used — the same SHA the caller pins this workflow to, and on its
           test branch.
         type: string
@@ -71,36 +71,36 @@ jobs:
             async function verifyPin({ github, env }) {
               const self = env.SELF_SHA || '';
               const ref = env.GOVERNANCE_REF || '';
-              if ((env.SELF_REPOSITORY || '').toLowerCase() !== 'marvinamiranda/.github') {
-                return `This workflow is running from ${env.SELF_REPOSITORY || 'an unknown repository'}, not marvinamiranda/.github.`;
+              if ((env.SELF_REPOSITORY || '').toLowerCase() !== 'thruuai/.github') {
+                return `This workflow is running from ${env.SELF_REPOSITORY || 'an unknown repository'}, not ThruuAi/.github.`;
               }
               if (!/^[0-9a-f]{40}$/.test(self)) {
                 return 'GitHub did not report the commit this workflow runs from (job.workflow_sha), so the pin cannot be checked.';
               }
               if (ref !== self) {
-                return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of marvinamiranda/.github.`;
+                return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of ThruuAi/.github.`;
               }
               // test is read as a branch, then compared by its sha: the bare
               // name "test" in a compare could resolve to a tag of that name.
               let tip;
               try {
-                const { data: branch } = await github.rest.repos.getBranch({ owner: 'marvinamiranda', repo: '.github', branch: 'test' });
+                const { data: branch } = await github.rest.repos.getBranch({ owner: 'ThruuAi', repo: '.github', branch: 'test' });
                 tip = branch && branch.commit && branch.commit.sha;
               } catch (error) {
-                return `Could not read marvinamiranda/.github test (HTTP ${error.status || '?'}), so the pin cannot be checked.`;
+                return `Could not read ThruuAi/.github test (HTTP ${error.status || '?'}), so the pin cannot be checked.`;
               }
               if (!/^[0-9a-f]{40}$/.test(tip || '')) {
-                return 'GitHub returned no commit for marvinamiranda/.github test, so the pin cannot be checked.';
+                return 'GitHub returned no commit for ThruuAi/.github test, so the pin cannot be checked.';
               }
               let status;
               try {
                 ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
-                  owner: 'marvinamiranda', repo: '.github', basehead: `${tip}...${self}`, per_page: 1 }));
+                  owner: 'ThruuAi', repo: '.github', basehead: `${tip}...${self}`, per_page: 1 }));
               } catch (error) {
-                return `Could not compare ${self} with marvinamiranda/.github test (HTTP ${error.status || '?'}).`;
+                return `Could not compare ${self} with ThruuAi/.github test (HTTP ${error.status || '?'}).`;
               }
               if (status !== 'identical' && status !== 'behind') {
-                return `${self} is not on marvinamiranda/.github test (GitHub compares it as "${status}"). Pin a merged commit of test, never a pull request branch or a fork.`;
+                return `${self} is not on ThruuAi/.github test (GitHub compares it as "${status}"). Pin a merged commit of test, never a pull request branch or a fork.`;
               }
               return '';
             }
@@ -117,7 +117,7 @@ jobs:
                 head_sha: pr.head.sha,
                 status: 'completed',
                 conclusion: 'failure',
-                output: { title: 'The governance pin is not a merged commit of marvinamiranda/.github', summary: problem },
+                output: { title: 'The governance pin is not a merged commit of ThruuAi/.github', summary: problem },
               });
               core.setFailed(problem);
             }
@@ -127,7 +127,7 @@ jobs:
         if: steps.pin.outputs.ok == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: marvinamiranda/.github
+          repository: ThruuAi/.github
           ref: ${{ inputs.governance-ref }}
           path: .org-governance
           sparse-checkout: governance/source-policy.js
