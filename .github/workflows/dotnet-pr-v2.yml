@@ -1,0 +1,417 @@
+# The PR lane for a .NET repository, v2: ONE job, one runner, one run per push.
+#
+#   select tests -> restore -> incremental build -> changed-file whitespace check -> tests
+#
+# v2 is a separate file so v1 callers (dotnet-pr.yml) are untouched. `incremental: true` turns the
+# build into the base branch's compiled output plus the delta (restored obj/, file times normalised),
+# and an optional `selector` script (read from the BASE of the pull request, never the head) picks the
+# unit tests and whether the RLS slice runs. Everything fails safe to what v1 did: no cache, no
+# manifest, a selector error, an unknown path.
+#
+# What the lane compiles: the unit-test projects (their closure is production code) and, only when the
+# selector says the RLS slice runs, the integration projects. E2E and the rest of the solution are
+# compiled by the repository's producer workflow after the merge (a red one files "CI is red on dev").
+#
+# Called from a thin `pr.yml` in each repository (CI rebuild plan, 2026-11-09). The
+# caller owns the trigger, the draft skip, the concurrency group and the path
+# handling; this file owns what runs. The check a ruleset requires is
+# `<caller job name> / ci`, so a caller whose job is named `pr` produces `pr / ci`.
+#
+# Deliberately NOT here: a custom trust gate, a budget, a load factor, a retry loop,
+# a `workflow_run` fan-out. A red test is red. The merge and nightly lanes
+# (dotnet-split-suite.yml) carry everything that does not fit in ten minutes.
+#
+# SECURITY. Read-only token. The package-feed secret reaches the RESTORE step only,
+# so the build and the tests of the pull request's own code run without it. Nothing
+# here is specific to one organisation's infrastructure, because this repository is
+# public. Callers pin this file by commit SHA.
+name: dotnet-pr-v2
+
+on:
+  workflow_call:
+    inputs:
+      solution:
+        description: Path of the solution (or project) to restore and build.
+        type: string
+        required: true
+      unit-projects:
+        description: Test projects run in full, space or newline separated.
+        type: string
+        required: true
+      integration-projects:
+        description: >-
+          Test projects that take the integration filter, space or newline separated. In incremental mode
+          they are compiled and run only when the selector says the slice is needed (`rls` is not `false`).
+        type: string
+        required: false
+        default: ""
+      integration-filter:
+        description: >-
+          `dotnet test --filter` expression for the integration projects. Empty means no
+          integration tests run in this lane (Testcontainers is available on ubuntu-24.04).
+        type: string
+        required: false
+        default: ""
+      msbuild-args:
+        description: Extra MSBuild arguments for restore and build (for example -p:Name=value).
+        type: string
+        required: false
+        default: ""
+      docs-only-regex:
+        description: >-
+          Extended regex. When EVERY file changed by the pull request matches it, the job
+          reports success after the checkout and runs nothing else. The job still reports, so
+          a required check is never left pending (a workflow-level `paths-ignore` would).
+          Empty means never skip.
+        type: string
+        required: false
+        default: ""
+      static-checks:
+        description: >-
+          Shell script run from the repository root before the restore, for cheap static checks
+          (a secret scan). It runs without the package token and a non-zero exit fails the job.
+          Empty means none.
+        type: string
+        required: false
+        default: ""
+      format-verify:
+        description: >-
+          Run `dotnet format whitespace` in verify mode (folder mode, no project load) on only the .cs
+          files the pull request changed against its base. The build itself runs with code-style
+          enforcement off, so this is the fast replacement; the full analysis belongs to the caller's nightly.
+        type: boolean
+        required: false
+        default: true
+      incremental:
+        description: >-
+          Restore the compiled output (obj/) that the repository's dev push saved, normalise file
+          times against it, and build with the flags that keep the commit id out of the compiler.
+          Needs a producer that saves the cache (see the caller's dev-compile). Off = v1 behaviour.
+        type: boolean
+        required: false
+        default: false
+      selector:
+        description: >-
+          Path, relative to the repository root, of a script that prints the tests this change needs
+          (see omni237 .github/ci/select-affected.py). It is read from HEAD^1 (the base), so a pull
+          request cannot edit its own selector. Empty, absent at the base, or failing: run everything.
+        type: string
+        required: false
+        default: ""
+      cache-dependency-path:
+        description: Files whose hash keys the NuGet cache (one glob per line).
+        type: string
+        required: false
+        default: |
+          **/packages.lock.json
+          **/Directory.*.props
+          **/*.csproj
+          global.json
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 15
+      runner:
+        description: Runner label.
+        type: string
+        required: false
+        default: ubuntu-24.04
+    secrets:
+      GH_PACKAGES_TOKEN:
+        description: Read-only token for the private package feed (read:packages).
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      MSBUILDDISABLENODEREUSE: "1"
+    steps:
+      - name: Checkout (the pull request merged into its base)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Docs-only change
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          IGNORE_REGEX: ${{ inputs.docs-only-regex }}
+        run: |
+          set -euo pipefail
+          skip=false
+          # On a pull_request the checkout is the merge commit: HEAD^1 is the base tip and
+          # HEAD^2 the pull request head, so this diff is exactly what the pull request changes.
+          if [ "$EVENT" = "pull_request" ] && [ -n "$IGNORE_REGEX" ] && git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            files="$(git diff --name-only 'HEAD^1' HEAD)"
+            # grep -v keeps the files that do NOT match; none left means every file is ignorable.
+            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -Eqv -- "$IGNORE_REGEX"; then
+              skip=true
+              echo "Every changed file matches the docs-only pattern; nothing to build."
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      # Runs on docs-only changes too: the secret scan must see a token pasted into a .md file
+      # (review pr-lane-v2-r1 note 2). It costs seconds.
+      - name: Static checks
+        if: inputs.static-checks != ''
+        env:
+          CHECKS: ${{ inputs.static-checks }}
+        run: bash -euo pipefail -c "$CHECKS"
+
+      # What does this change need? Runs the BASE's copy of the selector. Any problem: everything.
+      - name: Select tests
+        id: select
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          SELECTOR: ${{ inputs.selector }}
+          IGNORE_REGEX: ${{ inputs.docs-only-regex }}
+        run: |
+          set -uo pipefail
+          all() { { echo "scope=all"; echo "unit_mode=all"; echo "unit_filter="; echo "rls=true"; } >> "$GITHUB_OUTPUT"; echo "selection: $1; running everything"; }
+          if [ -z "$SELECTOR" ]; then all "no selector configured"; exit 0; fi
+          if ! git rev-parse -q --verify 'HEAD^2' >/dev/null; then all "not a merge checkout"; exit 0; fi
+          if ! git cat-file -e "HEAD^1:$SELECTOR" 2>/dev/null; then all "selector not present at the base"; exit 0; fi
+          git show "HEAD^1:$SELECTOR" > "$RUNNER_TEMP/pr-lane-selector.py"   # never name it select.py: it would shadow the stdlib module subprocess imports
+          out="$RUNNER_TEMP/select.out"; : > "$out"
+          if timeout 120 python3 -I "$RUNNER_TEMP/pr-lane-selector.py" --base HEAD^1 --head HEAD --docs-only-regex "$IGNORE_REGEX" --github-output "$out" > "$RUNNER_TEMP/select.json"; then
+            cat "$RUNNER_TEMP/select.json"
+            if grep -q '"reason": "selector error' "$RUNNER_TEMP/select.json"; then
+              echo "::warning::the selector failed and fell back to running everything (see the log above)"
+            fi
+            # multi-line safe: the selector writes single-line key=value pairs
+            grep -E '^(scope|unit_mode|unit_filter|rls)=' "$out" >> "$GITHUB_OUTPUT" || all "selector wrote no outputs"
+          else
+            all "selector failed"
+          fi
+
+      # The runner image carries the SDK (global.json says latestPatch of 10.0.101 and the image ships a
+      # newer 10.0.x); installing 10.0.101 on top costs ~12 s per run. Fail closed if the image has none.
+      - name: .NET SDK from the image (must satisfy global.json)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        id: sdk
+        run: |
+          set -euo pipefail
+          v="$(dotnet --version)"      # resolves global.json; fails when no installed SDK satisfies it
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "SDK $v"
+
+      - name: Setup .NET (SDK from global.json, NuGet cache)
+        if: steps.scope.outputs.skip != 'true' && !inputs.incremental
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: NuGet packages (restore from the dev cache)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # Compiled output of the dev tip (saved by the repository's dev push, never by a pull request:
+      # a cache written under a PR ref is invisible to every other PR). Prefix match picks the newest.
+      - name: Compiled output (restore obj/ from dev)
+        id: obj
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            src/**/obj
+            .ci-cache
+          key: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}
+          restore-keys: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-
+
+      # Fail closed. The BASE's copy runs (the head must not choose how its own times are normalised).
+      # A missing copy at the base (the first adoption) or a missing cache leaves every file stamped
+      # "now", which rebuilds everything: slow, never wrong. A script that FAILS is a red job: it stamps
+      # old before it stamps new, and a half-done run would hide a changed file behind a stale output.
+      - name: Normalise file times against the cached tree
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        run: |
+          set -euo pipefail
+          if [ ! -s .ci-cache/tree-manifest.txt ]; then
+            echo "::warning::no compiled-output cache from the base branch; this is a cold build"
+            exit 0
+          fi
+          if ! git cat-file -e 'HEAD^1:.github/ci/normalise-mtimes.sh' 2>/dev/null; then
+            echo "::warning::normalise-mtimes.sh is not present at the base; this is a cold build"
+            exit 0
+          fi
+          git show 'HEAD^1:.github/ci/normalise-mtimes.sh' > "$RUNNER_TEMP/normalise-mtimes.sh"
+          bash "$RUNNER_TEMP/normalise-mtimes.sh" .ci-cache/tree-manifest.txt
+
+      # The ONLY step that sees the package token. Build and tests below run without it.
+      # Incremental mode restores and builds the unit projects, plus the integration projects only when the selector
+      # says the RLS slice runs. The rest of the solution (E2E, AppHost) is compiled by the repository's producer
+      # workflow on the base branch after the merge.
+      - name: Restore
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          UNIT_PROJECTS: ${{ inputs.unit-projects }}
+          INTEGRATION_PROJECTS: ${{ inputs.integration-projects }}
+          RLS: ${{ steps.select.outputs.rls }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          words() { printf '%s\n' "$1" | tr -s ' \t' '\n' | sed '/^$/d'; }
+          if [ "$INCREMENTAL" = "true" ]; then
+            # the same predicate as the test step: anything but an explicit `false` builds what the slice needs
+            if [ "$RLS" = "false" ]; then INTEGRATION_PROJECTS=""; fi
+            mapfile -t targets < <(words "$UNIT_PROJECTS"$'\n'"$INTEGRATION_PROJECTS")
+          else
+            targets=("$SOLUTION")
+          fi
+          for t in "${targets[@]}"; do dotnet restore "$t" --nologo -v q "${extra[@]}"; done
+
+      # Warnings are errors where the repository's own Directory.Build.props says so: compiler warnings
+      # still fail the build. Only the IDE code-style rules are off here (EnforceCodeStyleInBuild
+      # costs about 1.5 minutes on a cold 2-core runner); the next step checks them on the changed
+      # files, and the caller's nightly builds with them on.
+      - name: Build (Release)
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          UNIT_PROJECTS: ${{ inputs.unit-projects }}
+          INTEGRATION_PROJECTS: ${{ inputs.integration-projects }}
+          RLS: ${{ steps.select.outputs.rls }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          words() { printf '%s\n' "$1" | tr -s ' \t' '\n' | sed '/^$/d'; }
+          flags=()
+          targets=("$SOLUTION")
+          if [ "$INCREMENTAL" = "true" ]; then
+            # Keep the commit id out of every compiler input (otherwise every push recompiles all
+            # projects: measured 18 Csc calls for a one-line change), and hard-link copy-local files
+            # (bin/ is not cached, so ~600 MB per test project would otherwise be copied).
+            flags=(-m:2 -p:IncludeSourceRevisionInInformationalVersion=false -p:EnableSourceLink=false
+                   -p:EmbedUntrackedSources=false -p:CreateHardLinksForCopyLocalIfPossible=true)
+            # the same predicate as the test step: anything but an explicit `false` builds what the slice needs
+            if [ "$RLS" = "false" ]; then INTEGRATION_PROJECTS=""; fi
+            mapfile -t targets < <(words "$UNIT_PROJECTS"$'\n'"$INTEGRATION_PROJECTS")
+          fi
+          for t in "${targets[@]}"; do
+            dotnet build "$t" -c Release --no-restore --nologo -v q -p:EnforceCodeStyleInBuild=false "${flags[@]}" "${extra[@]}"
+          done
+
+      # Style and whitespace on the changed files only, against the base (HEAD^1 of the merge commit).
+      # Deleted files are excluded; a pull request with no .cs change skips the step.
+      - name: Code style (changed files)
+        if: steps.scope.outputs.skip != 'true' && inputs.format-verify && github.event_name == 'pull_request'
+        timeout-minutes: 4
+        env:
+          SOLUTION: ${{ inputs.solution }}
+          INCREMENTAL: ${{ inputs.incremental }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR 'HEAD^1' HEAD -- '*.cs')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No .cs file changed; nothing to check."
+            exit 0
+          fi
+          echo "Checking ${#files[@]} changed .cs file(s)."
+          # `dotnet format style` loads the whole solution (about 90 s on a 2-core runner) and, with no
+          # .editorconfig/.globalconfig in the repository, has nothing to enforce (measured: unused usings, `this.`,
+          # var-vs-explicit all pass it). Whitespace in folder mode is about 1 s and loads no project.
+          if [ "$INCREMENTAL" = "true" ]; then
+            dotnet format whitespace --folder . --verify-no-changes --verbosity minimal --include "${files[@]}"
+          else
+            dotnet format whitespace "$SOLUTION" --verify-no-changes --no-restore --verbosity minimal --include "${files[@]}"
+            dotnet format style "$SOLUTION" --verify-no-changes --no-restore --verbosity minimal --include "${files[@]}"
+          fi
+
+      # v1 (incremental: false): unit tests, then the filtered integration tests, in sequence.
+      # v2 (incremental: true): the RLS slice (it waits on a Postgres container, so it does not compete
+      # for the two cores) starts first and runs while the unit tests run.
+      - name: Tests (unit, then RLS slice)
+        if: steps.scope.outputs.skip != 'true' && (steps.select.outputs.unit_mode != 'none' || (inputs.incremental && steps.select.outputs.rls != 'false' && inputs.integration-filter != ''))
+        env:
+          PROJECTS: ${{ inputs.unit-projects }}
+          UNIT_MODE: ${{ steps.select.outputs.unit_mode }}
+          UNIT_FILTER: ${{ steps.select.outputs.unit_filter }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          RLS: ${{ steps.select.outputs.rls }}
+          INT_PROJECTS: ${{ inputs.integration-projects }}
+          INT_FILTER: ${{ inputs.integration-filter }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/trx"
+          rc=0
+          rls_pid=""
+          if [ "$INCREMENTAL" = "true" ] && [ "$RLS" != "false" ] && [ -n "$INT_FILTER" ] && [ -n "$INT_PROJECTS" ]; then
+            ( for p in $INT_PROJECTS; do
+                name="$(basename "$p" .csproj)"
+                dotnet test "$p" --no-build --no-restore -c Release --nologo --filter "$INT_FILTER" \
+                  --logger "trx;LogFileName=$name.trx" --results-directory "$RUNNER_TEMP/trx/$name" || exit 1
+              done ) > "$RUNNER_TEMP/rls.log" 2>&1 &
+            rls_pid=$!
+          fi
+          if [ "$UNIT_MODE" != "none" ]; then
+            args=()
+            if [ "$UNIT_MODE" = "filter" ]; then
+              [ -n "$UNIT_FILTER" ] || { echo "selector said filter but gave none; refusing"; exit 1; }
+              args=(--filter "$UNIT_FILTER")
+            fi
+            for p in $PROJECTS; do
+              name="$(basename "$p" .csproj)"
+              echo "::group::dotnet test $name (${UNIT_MODE:-all})"
+              dotnet test "$p" --no-build --no-restore -c Release --nologo "${args[@]}" \
+                --logger "trx;LogFileName=$name.trx" --results-directory "$RUNNER_TEMP/trx/$name" || rc=1
+              echo "::endgroup::"
+            done
+          fi
+          if [ -n "$rls_pid" ]; then
+            wait "$rls_pid" || rc=1
+            echo "::group::RLS slice (ran alongside the unit tests)"; cat "$RUNNER_TEMP/rls.log"; echo "::endgroup::"
+          fi
+          exit "$rc"
+
+      - name: Integration tests (filtered)
+        if: steps.scope.outputs.skip != 'true' && !inputs.incremental && inputs.integration-filter != '' && inputs.integration-projects != ''
+        env:
+          PROJECTS: ${{ inputs.integration-projects }}
+          FILTER: ${{ inputs.integration-filter }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trx"
+          rc=0
+          for p in $PROJECTS; do
+            name="$(basename "$p" .csproj)"
+            echo "::group::dotnet test $name (filtered)"
+            dotnet test "$p" --no-build --no-restore -c Release --nologo --filter "$FILTER" \
+              --logger "trx;LogFileName=$name.trx" --results-directory "$RUNNER_TEMP/trx/$name" || rc=1
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
+      - name: Upload test results (failure only)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trx-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/trx/**
+          if-no-files-found: ignore
+          retention-days: 7
