@@ -6,7 +6,8 @@
 #
 # It reads the Actions API for the repository it is called from:
 #   * the runs of `nightly-workflow` on `branch` that concluded `success`, newest first, created
-#     within `max-age-days`;
+#     within `max-age-days`, triggered by `schedule` or `workflow_dispatch` only (never by a
+#     pull request or a push);
 #   * the first of them whose commit is still on `branch` (identical to its tip or behind it).
 # It fails, naming the reason, when there is none: no green nightly in the window is a reason to
 # stop and look, never to promote something untested.
@@ -74,7 +75,7 @@ jobs:
           since="$(date -u -d "$DAYS days ago" +%Y-%m-%d)"
           runs="$(gh api --method GET "repos/$REPO/actions/workflows/$WORKFLOW/runs" \
             -f branch="$BRANCH" -f status=success -f created=">=$since" -F per_page=100 \
-            --jq '[.workflow_runs[] | select(.conclusion == "success" and .head_branch == env.BRANCH)] | sort_by(.created_at) | reverse | .[] | [.head_sha, .html_url] | @tsv')"
+            --jq '[.workflow_runs[] | select(.conclusion == "success" and .head_branch == env.BRANCH and (.event == "schedule" or .event == "workflow_dispatch"))] | sort_by(.created_at) | reverse | .[] | [.head_sha, .html_url] | @tsv')"
           if [ -z "$runs" ]; then
             echo "::error::No green $WORKFLOW run on $BRANCH since $since. Nothing may be promoted; look at the nightly."
             exit 1

@@ -62,6 +62,15 @@ on:
         type: string
         required: false
         default: ""
+      format-verify:
+        description: >-
+          Run `dotnet format whitespace` and `dotnet format style` in verify mode on only the .cs
+          files the pull request changed against its base. The build itself runs with code-style
+          enforcement off (it costs minutes on every build), so this is the fast replacement; the
+          full analysis belongs to the caller's nightly.
+        type: boolean
+        required: false
+        default: true
       cache-dependency-path:
         description: Files whose hash keys the NuGet cache (one glob per line).
         type: string
@@ -154,7 +163,10 @@ jobs:
           read -r -a extra <<< "$MSBUILD_ARGS"
           dotnet restore "$SOLUTION" --nologo -v q "${extra[@]}"
 
-      # Warnings are errors where the repository's own Directory.Build.props says so.
+      # Warnings are errors where the repository's own Directory.Build.props says so: compiler warnings
+      # still fail the build. Only the IDE code-style rules are off here (EnforceCodeStyleInBuild
+      # costs about 1.5 minutes on a cold 2-core runner); the next step checks them on the changed
+      # files, and the caller's nightly builds with them on.
       - name: Build (Release)
         if: steps.scope.outputs.skip != 'true'
         env:
@@ -163,7 +175,25 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a extra <<< "$MSBUILD_ARGS"
-          dotnet build "$SOLUTION" -c Release --no-restore --nologo -v q "${extra[@]}"
+          dotnet build "$SOLUTION" -c Release --no-restore --nologo -v q -p:EnforceCodeStyleInBuild=false "${extra[@]}"
+
+      # Style and whitespace on the changed files only, against the base (HEAD^1 of the merge commit).
+      # Deleted files are excluded; a pull request with no .cs change skips the step.
+      - name: Code style (changed files)
+        if: steps.scope.outputs.skip != 'true' && inputs.format-verify && github.event_name == 'pull_request'
+        timeout-minutes: 4
+        env:
+          SOLUTION: ${{ inputs.solution }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR 'HEAD^1' HEAD -- '*.cs')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No .cs file changed; nothing to check."
+            exit 0
+          fi
+          echo "Checking ${#files[@]} changed .cs file(s)."
+          dotnet format whitespace "$SOLUTION" --verify-no-changes --no-restore --verbosity minimal --include "${files[@]}"
+          dotnet format style "$SOLUTION" --verify-no-changes --no-restore --verbosity minimal --include "${files[@]}"
 
       - name: Unit tests
         if: steps.scope.outputs.skip != 'true'
