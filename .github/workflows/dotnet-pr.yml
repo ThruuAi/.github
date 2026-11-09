@@ -54,6 +54,14 @@ on:
         type: string
         required: false
         default: ""
+      static-checks:
+        description: >-
+          Shell script run from the repository root before the restore, for cheap static checks
+          (a secret scan). It runs without the package token and a non-zero exit fails the job.
+          Empty means none.
+        type: string
+        required: false
+        default: ""
       cache-dependency-path:
         description: Files whose hash keys the NuGet cache (one glob per line).
         type: string
@@ -119,6 +127,12 @@ jobs:
             fi
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - name: Static checks
+        if: steps.scope.outputs.skip != 'true' && inputs.static-checks != ''
+        env:
+          CHECKS: ${{ inputs.static-checks }}
+        run: bash -euo pipefail -c "$CHECKS"
 
       - name: Setup .NET (SDK from global.json, NuGet cache)
         if: steps.scope.outputs.skip != 'true'
