@@ -84,6 +84,35 @@ Globs: `*` within a path segment, `**` across segments, `{a,b}` either.
 a required check that never starts is a merge freeze. Where a workflow is
 path-filtered, require its always-running aggregator instead (DELIVERY §10).
 
+## .NET PR lane v2 (`dotnet-pr-v2.yml`)
+
+A second, separate reusable workflow beside `dotnet-pr.yml` (v1 is untouched; callers move by changing the
+pinned file). One job named `ci`, so a caller job named `pr` produces the check `pr / ci`. With
+`incremental: false` it behaves as v1. With `incremental: true`:
+
+1. **Compiled output cache.** The caller's producer workflow (a push to the base branch, never a pull
+   request) saves `src/**/obj` plus `.ci-cache/tree-manifest.txt` (`git ls-files -s` of the tree it built)
+   under `obj-v1-<os>-<sdk>-<sha>`, and the NuGet packages under a key of the lock, props and project files.
+   The lane restores both by prefix (a pull request reads the caches of its base branch; it saves none).
+2. **File times.** `normalise-mtimes.sh` (the BASE's copy) stamps every tracked file 2000-01-01 and then
+   stamps "now" only the paths whose blob differs from the manifest, so MSBuild recompiles the delta and
+   nothing else. No cache, no manifest or no script at the base means every file stays "now": a cold build,
+   slow and never wrong. The script failing fails the job.
+3. **What compiles.** The unit projects, plus the integration projects only when the selector says the RLS
+   slice runs. E2E and the rest of the solution are compiled by the producer after the merge. The commit id
+   is kept out of the compiler (`IncludeSourceRevisionInInformationalVersion`, `EnableSourceLink`,
+   `EmbedUntrackedSources` off) or every push would recompile everything. The producer must use exactly the
+   same flags.
+4. **What runs.** The `selector` script (read from `HEAD^1`, run as `python3 -I`, 120 s timeout) prints
+   `scope`, `unit_mode` (`all`, `filter`, `none`), `unit_filter` and `rls`. A missing selector, a crash, no
+   output or an unknown path means everything. The RLS slice runs in the background beside the unit tests.
+5. **Style.** `dotnet format whitespace --folder` on the changed `.cs` files only. `format style` is not run:
+   without an `.editorconfig` it enforces nothing.
+
+Trust: the selector and the time normaliser run from the base, never from the pull request head, and a
+pull request that edits them changes `.github/**`, which the selector treats as "run everything". The
+package token reaches the restore step only. Callers pin this file by full commit SHA.
+
 ## PR governance
 
 The caller:
