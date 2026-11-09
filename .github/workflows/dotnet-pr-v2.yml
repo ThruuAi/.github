@@ -164,8 +164,10 @@ jobs:
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
+      # Runs on docs-only changes too: the secret scan must see a token pasted into a .md file
+      # (review pr-lane-v2-r1 note 2). It costs seconds.
       - name: Static checks
-        if: steps.scope.outputs.skip != 'true' && inputs.static-checks != ''
+        if: inputs.static-checks != ''
         env:
           CHECKS: ${{ inputs.static-checks }}
         run: bash -euo pipefail -c "$CHECKS"
