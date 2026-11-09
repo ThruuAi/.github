@@ -1,0 +1,257 @@
+# The merge and nightly lanes for a .NET repository: build ONCE, run the suite split over
+# N machines, one test project plus filter per machine, one test process per VM.
+#
+#   build (restore, build, upload the build output)
+#     -> shard x N   (download the build output, `dotnet test --no-build`, one process)
+#       -> summary   (if: always(); fails when the build or any shard failed)
+#
+# The shards come from the caller as JSON, so the split lives in the caller's file:
+#
+#   shards: '[{"label":"Unit","project":"src/Tests/X.Unit/X.Unit.csproj","filter":""},
+#             {"label":"E2E-1","project":"src/Tests/X.E2E/X.E2E.csproj","filter":"FullyQualifiedName~X.E2E.A"}]'
+#
+# A shard that selects no test fails: `dotnet test` exits 0 when a valid filter matches nothing, so
+# the shard reads the TRX it wrote and requires a non-zero total.
+#
+# WHY THE BUILD OUTPUT TRAVELS AS ONE TARBALL, AT THE SAME PATH. `dotnet test --no-build` reads
+# the project's evaluation (obj/project.assets.json, generated props) and the compiled output
+# (bin/Release), and both name absolute paths. Every shard therefore checks the repository out
+# at the same $GITHUB_WORKSPACE as the build job and unpacks the tarball over it. A tarball
+# rather than the artifact's own zip so file modes (the apphost executables) survive.
+#
+# Deliberately NOT here: a trust gate, a budget, a load factor, a retry loop, a `workflow_run`
+# fan-out. A red shard is red. Callers pin this file by commit SHA; nothing secret or specific to
+# one organisation's infrastructure belongs in this public repository.
+name: dotnet-split-suite
+
+on:
+  workflow_call:
+    inputs:
+      solution:
+        description: Path of the solution (or project) to restore and build.
+        type: string
+        required: true
+      shards:
+        description: >-
+          JSON array of {"label": string, "project": string, "filter": string}. `filter` is a
+          `dotnet test --filter` expression and may be empty.
+        type: string
+        required: true
+      msbuild-args:
+        description: Extra MSBuild arguments for restore and build.
+        type: string
+        required: false
+        default: ""
+      cache-dependency-path:
+        description: Files whose hash keys the NuGet cache (one glob per line).
+        type: string
+        required: false
+        default: |
+          **/packages.lock.json
+          **/Directory.*.props
+          **/*.csproj
+          global.json
+      hang-timeout:
+        description: Per-test hang timeout for `--blame-hang` (a dotnet duration such as 20m).
+        type: string
+        required: false
+        default: 20m
+      build-timeout-minutes:
+        description: Timeout of the build job.
+        type: number
+        required: false
+        default: 30
+      shard-timeout-minutes:
+        description: Timeout of each shard job.
+        type: number
+        required: false
+        default: 50
+      runner:
+        description: Runner label for every job.
+        type: string
+        required: false
+        default: ubuntu-24.04
+    secrets:
+      GH_PACKAGES_TOKEN:
+        description: Read-only token for the private package feed (read:packages).
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      MSBUILDDISABLENODEREUSE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup .NET (SDK from global.json, NuGet cache)
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      # The ONLY step that sees the package token.
+      - name: Restore
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          dotnet restore "$SOLUTION" --nologo -v q "${extra[@]}"
+
+      - name: Build (Release)
+        env:
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          dotnet build "$SOLUTION" -c Release --no-restore --nologo -v q "${extra[@]}"
+
+      - name: Pack the build output
+        run: |
+          set -euo pipefail
+          find . \( -name obj -o -path '*/bin/Release' \) -type d -not -path './.git/*' -prune -print0 \
+            | GZIP=-1 tar --null -T - -czf "$RUNNER_TEMP/build-output.tgz"
+          ls -l "$RUNNER_TEMP/build-output.tgz"
+          echo "workspace=$GITHUB_WORKSPACE" > "$RUNNER_TEMP/workspace.txt"
+
+      - name: Upload the build output
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/build-output.tgz
+            ${{ runner.temp }}/workspace.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  shard:
+    name: ${{ matrix.shard.label }}
+    needs: build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.shard-timeout-minutes }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      MSBUILDDISABLENODEREUSE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup .NET (SDK from global.json, NuGet cache)
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: Download the build output
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build-output
+
+      - name: Unpack over the checkout (same workspace path as the build)
+        run: |
+          set -euo pipefail
+          built="$(sed -n 's/^workspace=//p' "$RUNNER_TEMP/build-output/workspace.txt")"
+          if [ "$built" != "$GITHUB_WORKSPACE" ]; then
+            echo "::error::The build ran in $built but this shard runs in $GITHUB_WORKSPACE; dotnet test --no-build needs identical paths."
+            exit 1
+          fi
+          tar -xzf "$RUNNER_TEMP/build-output/build-output.tgz" -C "$GITHUB_WORKSPACE"
+
+      - name: Test (${{ matrix.shard.label }})
+        id: test
+        env:
+          LABEL: ${{ matrix.shard.label }}
+          PROJECT: ${{ matrix.shard.project }}
+          FILTER: ${{ matrix.shard.filter }}
+          HANG: ${{ inputs.hang-timeout }}
+        run: |
+          set -euo pipefail
+          safe="${LABEL//[^A-Za-z0-9._-]/_}"
+          echo "safe=$safe" >> "$GITHUB_OUTPUT"
+          out="$RUNNER_TEMP/trx"
+          mkdir -p "$out"
+          args=()
+          [ -n "$FILTER" ] && args+=(--filter "$FILTER")
+          dotnet test "$PROJECT" --no-build --no-restore -c Release --nologo "${args[@]}" \
+            --blame-hang --blame-hang-timeout "$HANG" --blame-hang-dump-type mini \
+            --logger "trx;LogFileName=$safe.trx" --logger "console;verbosity=normal" \
+            --results-directory "$out"
+          # A filter that selects nothing must not pass: the TRX has to report at least one test.
+          total="$(grep -o '<Counters total="[0-9]*"' "$out/$safe.trx" | head -n1 | grep -o '[0-9]*' || echo 0)"
+          echo "Shard $LABEL ran $total test(s)."
+          if [ "${total:-0}" -eq 0 ]; then
+            echo "::error::Shard $LABEL selected no tests (project $PROJECT, filter '$FILTER')."
+            exit 1
+          fi
+
+      - name: Upload test results (failure only)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trx-${{ steps.test.outputs.safe || 'shard' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/trx/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  summary:
+    name: summary
+    needs: [build, shard]
+    if: always()
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Fail when the build or any shard did not succeed
+        env:
+          BUILD: ${{ needs.build.result }}
+          SHARDS: ${{ needs.shard.result }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          echo "build: $BUILD; shards: $SHARDS"
+          if [ "$BUILD" != "success" ] || [ "$SHARDS" != "success" ]; then
+            echo "Not green. Jobs that did not succeed:"
+            gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
+              --jq '.jobs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped") | "- \(.name): \(.conclusion)"' \
+              | tee -a "$GITHUB_STEP_SUMMARY" || true
+            echo "::error::The suite is not green (build: $BUILD, shards: $SHARDS)."
+            exit 1
+          fi
+          echo "All shards green."

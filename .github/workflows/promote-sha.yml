@@ -1,0 +1,95 @@
+# Which commit of the integration branch may be promoted?  The newest one whose nightly run is green.
+#
+# Promotion re-runs nothing. The nightly already ran the whole suite on that exact commit, so
+# promotion = pick that SHA, build the images once, deploy, smoke. Building and deploying stay in
+# each repository's own `deploy` workflow; this file only answers "which SHA".
+#
+# It reads the Actions API for the repository it is called from:
+#   * the runs of `nightly-workflow` on `branch` that concluded `success`, newest first, created
+#     within `max-age-days`;
+#   * the first of them whose commit is still on `branch` (identical to its tip or behind it).
+# It fails, naming the reason, when there is none: no green nightly in the window is a reason to
+# stop and look, never to promote something untested.
+#
+# The caller must grant `actions: read`; a called workflow cannot hold more than its caller gives.
+name: promote-sha
+
+on:
+  workflow_call:
+    inputs:
+      nightly-workflow:
+        description: File name of the nightly workflow in the calling repository.
+        type: string
+        required: false
+        default: nightly.yml
+      branch:
+        description: Integration branch the nightly runs on.
+        type: string
+        required: false
+        default: dev
+      max-age-days:
+        description: How far back a green nightly may be.
+        type: number
+        required: false
+        default: 7
+      runner:
+        description: Runner label.
+        type: string
+        required: false
+        default: ubuntu-24.04
+    outputs:
+      sha:
+        description: The newest commit on the branch with a green nightly.
+        value: ${{ jobs.resolve.outputs.sha }}
+      run-url:
+        description: The green nightly run that vouches for it.
+        value: ${{ jobs.resolve.outputs.run-url }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  resolve:
+    name: resolve-sha
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      run-url: ${{ steps.pick.outputs.run-url }}
+    steps:
+      - name: Newest commit with a green nightly
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ inputs.nightly-workflow }}
+          BRANCH: ${{ inputs.branch }}
+          DAYS: ${{ inputs.max-age-days }}
+        run: |
+          set -euo pipefail
+          since="$(date -u -d "$DAYS days ago" +%Y-%m-%d)"
+          runs="$(gh api --method GET "repos/$REPO/actions/workflows/$WORKFLOW/runs" \
+            -f branch="$BRANCH" -f status=success -f created=">=$since" -F per_page=100 \
+            --jq '[.workflow_runs[] | select(.conclusion == "success" and .head_branch == env.BRANCH)] | sort_by(.created_at) | reverse | .[] | [.head_sha, .html_url] | @tsv')"
+          if [ -z "$runs" ]; then
+            echo "::error::No green $WORKFLOW run on $BRANCH since $since. Nothing may be promoted; look at the nightly."
+            exit 1
+          fi
+          while IFS=$'\t' read -r sha url; do
+            # compare base...head: head "ahead" or "identical" means base (the nightly's commit) is on the branch.
+            status="$(gh api "repos/$REPO/compare/$sha...$BRANCH" --jq .status 2>/dev/null || echo unknown)"
+            case "$status" in
+              ahead|identical)
+                echo "sha=$sha" >> "$GITHUB_OUTPUT"
+                echo "run-url=$url" >> "$GITHUB_OUTPUT"
+                echo "Promote $sha (green nightly: $url)" | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+              *) echo "Skipping $sha: compare with $BRANCH says '$status'." ;;
+            esac
+          done <<< "$runs"
+          echo "::error::Green $WORKFLOW runs exist since $since, but none of their commits is on $BRANCH any more."
+          exit 1
