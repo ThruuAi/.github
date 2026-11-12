@@ -49,6 +49,10 @@ jobs:
         env:
           IDENTITY_REQUIRE_ZSH: '1'
         run: node governance/tests/identity.test.js
+      - name: split-suite workflow (job-private .NET state, runner group)
+        run: python3 governance/tests/split-suite-workflow.test.py
+      - name: split-suite workflow, mutation proof
+        run: python3 governance/tests/split-suite-workflow.mutations.py
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
       - name: identity manifests parse

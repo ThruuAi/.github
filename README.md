@@ -113,6 +113,37 @@ Trust: the selector and the time normaliser run from the base, never from the pu
 pull request that edits them changes `.github/**`, which the selector treats as "run everything". The
 package token reaches the restore step only. Callers pin this file by full commit SHA.
 
+## .NET split suite (`dotnet-split-suite.yml`)
+
+The merge and nightly lanes: one `build` job (restore, build, upload the compiled output), then one `shard`
+job per entry of the caller's `shards` JSON (each downloads the output and runs `dotnet test --no-build`),
+then a `summary` job that fails unless every one passed. Callers pin the file by full commit SHA.
+
+**Job-private .NET state.** The first step of `build` and of every `shard` writes `DOTNET_INSTALL_DIR`,
+`DOTNET_CLI_HOME`, `NUGET_PACKAGES` and `NUGET_HTTP_CACHE_PATH` to `GITHUB_ENV`, all under `$RUNNER_TEMP`
+(`dotnet`, `dotnet-home`, `nuget-packages`, `nuget-http-cache`); the second step fails the job unless each of
+the four is a folder under `$RUNNER_TEMP` (no `..`, never `$RUNNER_TEMP` itself, never an empty
+`$RUNNER_TEMP`). Nothing that restores, builds or tests therefore reads or writes the runner account's home:
+not `~/.nuget/packages`, not the NuGet HTTP cache, not the user `NuGet.Config` (the SDK looks for it under
+`DOTNET_CLI_HOME`), not `~/.dotnet`. The runner empties `$RUNNER_TEMP` before and after every job. A caller's
+`env:` is not passed into a called workflow, so only this file can do it. `actions/checkout` runs with
+`clean: true`. `summary` runs no .NET and has no such steps; `governance/tests/split-suite-workflow.test.py`
+finds the jobs that run .NET by what their steps do and fails if one lacks them.
+
+**NuGet cache.** `setup-dotnet`'s cache follows `NUGET_PACKAGES`, so on a GitHub-hosted runner it caches the
+job-private folder (cold once after a caller re-pins: the cache version is derived from the folder's path).
+On a self-hosted runner it is off (`runner.environment`, no input): a cache restored from a shared key into
+a persistent runner is a package nobody verified.
+
+**Runner group.** `runner` is one label, as before. The optional `runner-group` input (default empty) makes
+every job run on `{group: runner-group, labels: [runner]}`; empty, `runs-on` is exactly `inputs.runner`.
+**A caller on a persistent self-hosted runner MUST pin a restricted runner group**: the private folders do not
+protect a runner that untrusted pull-request code can also reach.
+
+**Trust.** Every shard unpacks the `obj` and `bin/Release` tarball the `build` job produced and runs it.
+`build` and the shards check out the same ref, so they trust exactly what the build compiled; the tarball is
+not signed.
+
 ## PR governance
 
 The caller:

@@ -19,6 +19,32 @@
 # at the same $GITHUB_WORKSPACE as the build job and unpacks the tarball over it. A tarball
 # rather than the artifact's own zip so file modes (the apphost executables) survive.
 #
+# JOB-PRIVATE .NET STATE (ThruuAi/.github#5). The FIRST step of `build` and of every `shard` writes
+# DOTNET_INSTALL_DIR, DOTNET_CLI_HOME, NUGET_PACKAGES and NUGET_HTTP_CACHE_PATH to GITHUB_ENV, all
+# under $RUNNER_TEMP, and the second step fails the job unless each is a folder under $RUNNER_TEMP.
+# `setup-dotnet`, restore and test therefore never read or write the runner account's home: not
+# ~/.nuget/packages, not the NuGet HTTP cache, not the user NuGet.Config (the SDK reads it from
+# DOTNET_CLI_HOME), not ~/.dotnet. The runner empties $RUNNER_TEMP before and after every job. A
+# caller's `env:` is not passed into a called workflow, so only this file can do it. `summary` runs no
+# .NET and has no such steps; the workflow test fails if a .NET step ever appears in a job without them.
+#
+# NuGet CACHE. `setup-dotnet`'s `cache` follows NUGET_PACKAGES (it asks `dotnet nuget locals`), so on a
+# GitHub-hosted runner it caches the job-private folder (one cold run after a caller re-pins: the cache
+# version is derived from the folder's path). On a SELF-HOSTED runner it is OFF: a cache restored from a
+# shared key into a persistent runner is a package nobody verified, and a shard then runs with no
+# package folder. `dotnet test --no-build --no-restore` did not need one when measured on a plain
+# xunit project: the package props the build wrote are guarded by Exists() and the test output carries
+# its dependencies. The decision keys on `runner.environment`, so it needs no input.
+#
+# PERSISTENT RUNNERS. A caller that runs this on a self-hosted runner MUST pin a restricted runner
+# group (input `runner-group`): the folders above cannot protect a runner that untrusted pull-request
+# code can also reach.
+#
+# THE BUILD OUTPUT IS TRUSTED BY DESIGN. Each shard unpacks the tarball the `build` job produced (the
+# `obj` and `bin/Release` folders of the workspace) and runs the compiled test assemblies from it.
+# `build` and the shards check out the same ref of the same repository, so the shards trust exactly the
+# code the build compiled; the tarball is not signed or re-verified.
+#
 # Deliberately NOT here: a trust gate, a budget, a load factor, a retry loop, a `workflow_run`
 # fan-out. A red shard is red. Callers pin this file by commit SHA; nothing secret or specific to
 # one organisation's infrastructure belongs in this public repository.
@@ -71,6 +97,14 @@ on:
         type: string
         required: false
         default: ubuntu-24.04
+      runner-group:
+        description: >-
+          Runner group for every job. Empty (the default) runs on `runner` alone, as before. When set,
+          every job runs on {group: runner-group, labels: [runner]}. A caller on a persistent
+          self-hosted runner must set it to a restricted group.
+        type: string
+        required: false
+        default: ""
     secrets:
       GH_PACKAGES_TOKEN:
         description: Read-only token for the private package feed (read:packages).
@@ -82,7 +116,7 @@ permissions:
 jobs:
   build:
     name: build
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner-group != '' && fromJSON(format('{{"group":{0},"labels":[{1}]}}', toJSON(inputs.runner-group), toJSON(inputs.runner))) || inputs.runner }}
     timeout-minutes: ${{ inputs.build-timeout-minutes }}
     permissions:
       contents: read
@@ -92,17 +126,45 @@ jobs:
       DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
       MSBUILDDISABLENODEREUSE: "1"
     steps:
+      # Job-private locations, FIRST: nothing below may read or write the runner account's home
+      # (see JOB-PRIVATE .NET STATE above). Same lines as the callers' own jobs write.
+      - name: Use job-owned .NET and NuGet locations
+        run: |
+          printf 'DOTNET_INSTALL_DIR=%s/dotnet\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'DOTNET_CLI_HOME=%s/dotnet-home\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'NUGET_PACKAGES=%s/nuget-packages\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'NUGET_HTTP_CACHE_PATH=%s/nuget-http-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Fail unless the .NET and NuGet locations are job-owned
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "FAIL RUNNER_TEMP is unset or empty" >&2
+            exit 1
+          fi
+          for name in DOTNET_INSTALL_DIR DOTNET_CLI_HOME NUGET_PACKAGES NUGET_HTTP_CACHE_PATH; do
+            value="${!name:-}"
+            echo "$name=${value:-<unset>}"
+            case "$value" in
+              *..*) echo "FAIL $name contains '..'" >&2; exit 1 ;;
+              "$RUNNER_TEMP"/?*) ;;
+              *) echo "FAIL $name is '${value:-<unset>}', not a folder under RUNNER_TEMP ($RUNNER_TEMP): this job would read the runner account's .NET or NuGet state" >&2; exit 1 ;;
+            esac
+          done
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          clean: true
           fetch-depth: 1
 
       - name: Setup .NET (SDK from global.json, NuGet cache)
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           global-json-file: global.json
-          cache: true
+          # Off on a self-hosted runner (see NuGet CACHE above). The expression is a boolean string.
+          cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: ${{ inputs.cache-dependency-path }}
 
       # The ONLY step that sees the package token.
@@ -147,7 +209,7 @@ jobs:
   shard:
     name: ${{ matrix.shard.label }}
     needs: build
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner-group != '' && fromJSON(format('{{"group":{0},"labels":[{1}]}}', toJSON(inputs.runner-group), toJSON(inputs.runner))) || inputs.runner }}
     timeout-minutes: ${{ inputs.shard-timeout-minutes }}
     permissions:
       contents: read
@@ -161,17 +223,45 @@ jobs:
       DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
       MSBUILDDISABLENODEREUSE: "1"
     steps:
+      # Job-private locations, FIRST: nothing below may read or write the runner account's home
+      # (see JOB-PRIVATE .NET STATE above). Same lines as the callers' own jobs write.
+      - name: Use job-owned .NET and NuGet locations
+        run: |
+          printf 'DOTNET_INSTALL_DIR=%s/dotnet\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'DOTNET_CLI_HOME=%s/dotnet-home\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'NUGET_PACKAGES=%s/nuget-packages\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'NUGET_HTTP_CACHE_PATH=%s/nuget-http-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Fail unless the .NET and NuGet locations are job-owned
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "FAIL RUNNER_TEMP is unset or empty" >&2
+            exit 1
+          fi
+          for name in DOTNET_INSTALL_DIR DOTNET_CLI_HOME NUGET_PACKAGES NUGET_HTTP_CACHE_PATH; do
+            value="${!name:-}"
+            echo "$name=${value:-<unset>}"
+            case "$value" in
+              *..*) echo "FAIL $name contains '..'" >&2; exit 1 ;;
+              "$RUNNER_TEMP"/?*) ;;
+              *) echo "FAIL $name is '${value:-<unset>}', not a folder under RUNNER_TEMP ($RUNNER_TEMP): this job would read the runner account's .NET or NuGet state" >&2; exit 1 ;;
+            esac
+          done
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          clean: true
           fetch-depth: 1
 
       - name: Setup .NET (SDK from global.json, NuGet cache)
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           global-json-file: global.json
-          cache: true
+          # Off on a self-hosted runner (see NuGet CACHE above). The expression is a boolean string.
+          cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: ${{ inputs.cache-dependency-path }}
 
       - name: Download the build output
@@ -230,7 +320,7 @@ jobs:
     name: summary
     needs: [build, shard]
     if: always()
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner-group != '' && fromJSON(format('{{"group":{0},"labels":[{1}]}}', toJSON(inputs.runner-group), toJSON(inputs.runner))) || inputs.runner }}
     timeout-minutes: 5
     permissions:
       actions: read
