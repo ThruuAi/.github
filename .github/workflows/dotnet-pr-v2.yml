@@ -21,6 +21,19 @@
 # a `workflow_run` fan-out. A red test is red. The merge and nightly lanes
 # (dotnet-split-suite.yml) carry everything that does not fit in ten minutes.
 #
+# JOB-PRIVATE NUGET FOLDERS (`job-private-nuget`, ThruuAi/.github#7). OFF by default: nothing changes for a caller
+# that does not set it. ON, the first two steps write NUGET_PACKAGES and NUGET_HTTP_CACHE_PATH to GITHUB_ENV, both
+# under $RUNNER_TEMP, and fail the job unless each is a folder under it; the NuGet cache is then restored INTO
+# `$RUNNER_TEMP/nuget-packages`. Why it is a switch and not a default: a restored compiled-output cache (obj/) is
+# only reusable when the packages folder has the SAME ABSOLUTE PATH as the job that built it (MSBuild hashes the
+# package reference paths into every project's compile inputs: a different path recompiled all 18 projects of
+# omni237's unit-test closure, measured), so the lane's folder must be whatever the caller's producer workflow
+# builds against. A producer that builds against `$RUNNER_TEMP/nuget-packages` (the isolation rule: a job's restore
+# never resolves out of a folder a local `dotnet pack` can write to) sets `job-private-nuget: true`; a producer that
+# uses `~/.nuget/packages` leaves it false. Both jobs must run on runners that give the same $RUNNER_TEMP string:
+# on a GitHub-hosted ubuntu-24.04 runner it is /home/runner/work/_temp for every job. A caller's `env:` is not
+# passed into a called workflow, so only this file can set the folders.
+#
 # SECURITY. Read-only token. The package-feed secret reaches the RESTORE step only,
 # so the build and the tests of the pull request's own code run without it. Nothing
 # here is specific to one organisation's infrastructure, because this repository is
@@ -107,6 +120,17 @@ on:
           **/Directory.*.props
           **/*.csproj
           global.json
+      job-private-nuget:
+        description: >-
+          Use job-private NuGet folders: write NUGET_PACKAGES=$RUNNER_TEMP/nuget-packages and
+          NUGET_HTTP_CACHE_PATH=$RUNNER_TEMP/nuget-http-cache to GITHUB_ENV first, fail unless both are folders
+          under $RUNNER_TEMP, and restore the NuGet cache into $RUNNER_TEMP/nuget-packages instead of
+          ~/.nuget/packages. Set it when the caller's producer workflow (the one that saves the compiled output the
+          lane restores) builds against $RUNNER_TEMP/nuget-packages: the cached obj/ is reusable only when the
+          packages folder has the same path. Default false: the lane keeps ~/.nuget/packages, as before.
+        type: boolean
+        required: false
+        default: false
       timeout-minutes:
         description: Job timeout.
         type: number
@@ -138,6 +162,31 @@ jobs:
       DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
       MSBUILDDISABLENODEREUSE: "1"
     steps:
+      # FIRST, before checkout, the static checks or any .NET step (see JOB-PRIVATE NUGET FOLDERS above).
+      - name: Use job-owned NuGet locations
+        if: inputs.job-private-nuget
+        run: |
+          printf 'NUGET_PACKAGES=%s/nuget-packages\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'NUGET_HTTP_CACHE_PATH=%s/nuget-http-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Fail unless the NuGet locations are job-owned
+        if: inputs.job-private-nuget
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "FAIL RUNNER_TEMP is unset or empty" >&2
+            exit 1
+          fi
+          for name in NUGET_PACKAGES NUGET_HTTP_CACHE_PATH; do
+            value="${!name:-}"
+            echo "$name=${value:-<unset>}"
+            case "$value" in
+              *..*) echo "FAIL $name contains '..'" >&2; exit 1 ;;
+              "$RUNNER_TEMP"/?*) ;;
+              *) echo "FAIL $name is '${value:-<unset>}', not a folder under RUNNER_TEMP ($RUNNER_TEMP): this job would read the runner account's NuGet state" >&2; exit 1 ;;
+            esac
+          done
+
       - name: Checkout (the pull request merged into its base)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -221,7 +270,8 @@ jobs:
         if: steps.scope.outputs.skip != 'true' && inputs.incremental
         uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
-          path: ~/.nuget/packages
+          # The folder the compiled-output cache below was built against (see JOB-PRIVATE NUGET FOLDERS).
+          path: ${{ inputs.job-private-nuget && format('{0}/nuget-packages', runner.temp) || '~/.nuget/packages' }}
           key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
           restore-keys: nuget-${{ runner.os }}-
 

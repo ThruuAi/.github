@@ -53,6 +53,10 @@ jobs:
         run: python3 governance/tests/split-suite-workflow.test.py
       - name: split-suite workflow, mutation proof
         run: python3 governance/tests/split-suite-workflow.mutations.py
+      - name: PR lane v2 workflow (job-private NuGet folders, opt-in)
+        run: python3 governance/tests/pr-lane-v2-workflow.test.py
+      - name: PR lane v2 workflow, mutation proof
+        run: python3 governance/tests/pr-lane-v2-workflow.mutations.py
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
       - name: identity manifests parse
