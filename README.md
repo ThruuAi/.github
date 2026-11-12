@@ -109,6 +109,23 @@ pinned file). One job named `ci`, so a caller job named `pr` produces the check 
 5. **Style.** `dotnet format whitespace --folder` on the changed `.cs` files only. `format style` is not run:
    without an `.editorconfig` it enforces nothing.
 
+6. **Job-private NuGet folders (opt-in, `job-private-nuget`, default `false`).** The cached `obj/` is reusable only
+   when the NuGet packages folder has the same absolute path as in the job that built it (MSBuild hashes the package
+   reference paths into every project's compile inputs; a different path recompiled every project of omni237's
+   unit-test closure, 18 of 18). The lane restores NuGet into `~/.nuget/packages` unless this input is set, so a
+   producer that builds against `$RUNNER_TEMP/nuget-packages` (omni237's `dev-compile.yml`, whose restore must never
+   resolve out of a folder a local `dotnet pack` can write to) needs it. Set `job-private-nuget: true` and the first
+   two steps of the job write `NUGET_PACKAGES=$RUNNER_TEMP/nuget-packages` and
+   `NUGET_HTTP_CACHE_PATH=$RUNNER_TEMP/nuget-http-cache` to `GITHUB_ENV` and fail the job unless both are folders
+   under `$RUNNER_TEMP` (the same two steps `dotnet-split-suite.yml` runs, for these two variables), and the NuGet cache
+   is restored into `$RUNNER_TEMP/nuget-packages`. The key and restore-keys do not change. Both jobs must see the same
+   `$RUNNER_TEMP` string: on a GitHub-hosted `ubuntu-24.04` runner it is `/home/runner/work/_temp` for every job; a
+   producer and a lane on different kinds of runner would not match and the lane would recompile (slow, never wrong).
+   A caller's `env:` is not passed into a called workflow, so only this file can set the folders. With the input false
+   nothing changes for the caller (the two steps are skipped and the cache path is the literal `~/.nuget/packages`).
+   `governance/tests/pr-lane-v2-workflow.test.py` pins this and runs the two steps as bash;
+   `pr-lane-v2-workflow.mutations.py` proves 20 weakenings red.
+
 Trust: the selector and the time normaliser run from the base, never from the pull request head, and a
 pull request that edits them changes `.github/**`, which the selector treats as "run everything". The
 package token reaches the restore step only. Callers pin this file by full commit SHA.
