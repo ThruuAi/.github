@@ -8,6 +8,7 @@ rewritten workflow cannot leave a mutant that silently mutates nothing.
 
     python3 governance/tests/pr-lane-v2-speed.mutations.py
 """
+import concurrent.futures
 import hashlib
 import os
 import subprocess
@@ -112,31 +113,45 @@ MUTANTS = [
 
 
 def run(path):
+    """One mutant against the suite. `-f` stops at the first failing test: a killed mutant needs one red test, and the
+    whole suite takes about 13 s because of its real-time process tests (a job limit of 5 minutes holds the proof)."""
     env = dict(os.environ, PR_LANE_V2_WORKFLOW=path)
-    return subprocess.run([sys.executable, TEST], capture_output=True, text=True, env=env)
+    return subprocess.run([sys.executable, TEST, '-f'], capture_output=True, text=True, env=env)
 
 
-baseline = run(WORKFLOW)
+baseline = subprocess.run([sys.executable, TEST], capture_output=True, text=True,
+                          env=dict(os.environ, PR_LANE_V2_WORKFLOW=WORKFLOW))
 print(f'baseline: exit {baseline.returncode} (must be 0)')
 bad = 1 if baseline.returncode != 0 else 0
 workdir = tempfile.mkdtemp(prefix='pr-lane-speed-mut-')
-for name, mutate in MUTANTS:
+
+
+def judge(item):
+    index, (name, mutate) = item
     mutated, error = mutate(SOURCE)
     if error or mutated == SOURCE:
-        bad += 1
-        print(f'BROKEN MUTANT - {name}: {error or "nothing changed"}')
-        continue
-    path = os.path.join(workdir, 'mutant.yml')
+        return name, 'broken', error or 'nothing changed', ''
+    path = os.path.join(workdir, f'mutant-{index}.yml')
     with open(path, 'w', encoding='utf-8') as handle:
         handle.write(mutated)
     result = run(path)
-    red = result.returncode != 0
+    os.remove(path)
     failing = next((l for l in result.stderr.splitlines() if l.startswith(('FAIL:', 'ERROR:'))), '')[:110]
-    if not red:
+    return name, ('killed' if result.returncode != 0 else 'survived'), '', failing
+
+
+# Mutants are independent copies of the workflow, so they run side by side (four at a time).
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    verdicts = list(pool.map(judge, enumerate(MUTANTS)))
+for name, verdict, error, failing in verdicts:
+    if verdict == 'broken':
         bad += 1
-    print(f"{'killed  ' if red else 'SURVIVED'} - {name}{('  [' + failing + ']') if red else ''}")
-if os.path.exists(os.path.join(workdir, 'mutant.yml')):
-    os.remove(os.path.join(workdir, 'mutant.yml'))
+        print(f'BROKEN MUTANT - {name}: {error}')
+    elif verdict == 'survived':
+        bad += 1
+        print(f'SURVIVED - {name}')
+    else:
+        print(f'killed   - {name}  [{failing}]')
 os.rmdir(workdir)
 with open(WORKFLOW, 'rb') as handle:
     after = hashlib.sha256(handle.read()).hexdigest()
