@@ -126,25 +126,14 @@ pinned file). One job named `ci`, so a caller job named `pr` produces the check 
    `governance/tests/pr-lane-v2-workflow.test.py` pins this and runs the two steps as bash;
    `pr-lane-v2-workflow.mutations.py` proves 20 weakenings red.
 
-7. **Three speed switches (opt-in, default `false`, ThruuAi/.github#9).** None removes a check; a caller that sets none
-   sees no change (the new steps are skipped and the old ones keep their shape).
-   * `global-json-sdk`: with `incremental`, a step installs exactly the SDK `global.json` names (`setup-dotnet`,
-     `DOTNET_INSTALL_DIR=$RUNNER_TEMP/dotnet`, so it is the only SDK the job can resolve), and the SDK step fails the job
-     unless `dotnet --version` is that version. Why: the cached `obj/` is reusable only when it was built with the same
-     SDK at the same path (the SDK's targeting pack and analyzers are compile inputs, so another patch recompiles every
-     project), and the hosted image carries different SDK patches on different machines during a roll (10.0.114 and
-     10.0.115 side by side for days), so a lane that takes the image's SDK restores a compiled output built with the
-     other patch, or an old one of its own. The caller's producer must make the same install (omni237 `dev-compile.yml`
-     does). Cost: one SDK download, about 12 s measured, instead of 3 s. To change the SDK, change `global.json`.
-   * `static-checks-background`: the `static-checks` script starts in the background (detached, output to a file) and
-     `Static checks (result)`, placed after the cache restores and before `Restore`, joins it, prints its log and fails
-     the job if the script failed, never started, died without writing a result, or gave none in 10 minutes. The checks
-     therefore overlap the NuGet cache download (about a minute) instead of running before it. A failed check still
-     stops the job before the restore and the build.
-   * `build-together`: the unit and the integration projects build in one MSBuild invocation (a traversal project
-     generated in `$RUNNER_TEMP`, `BuildInParallel`) instead of one `dotnet build` after the other, with the same flags.
-   `governance/tests/pr-lane-v2-speed.test.py` pins the inputs, the step order and conditions and runs the steps as bash
-   with a fake `dotnet`; `pr-lane-v2-speed.mutations.py` proves 31 weakenings red.
+7. **Static checks in the background (opt-in, `static-checks-background`, default `false`, ThruuAi/.github#9).**
+   The `static-checks` script starts detached (output to a file, `nice -n 10`) and `Static checks (result)`, placed after
+   the cache restores and before `Restore`, joins it, prints its log and fails the job if the script failed, never
+   started, died without writing a result, or gave none in 10 minutes. The checks therefore overlap the NuGet cache
+   download (about a minute) instead of running before it, and a failed check still stops the job before the restore
+   and the build. A caller that does not set it sees no change. `governance/tests/pr-lane-v2-speed.test.py` pins the
+   input, the step order and condition and runs the steps as bash; `pr-lane-v2-speed.mutations.py` proves its
+   weakenings red.
 
 Trust: the selector and the time normaliser run from the base, never from the pull request head, and a
 pull request that edits them changes `.github/**`, which the selector treats as "run everything". The

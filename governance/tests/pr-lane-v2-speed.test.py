@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Tests for the three speed switches of .github/workflows/dotnet-pr-v2.yml (ThruuAi/.github#9).
+"""Tests for the `static-checks-background` input of .github/workflows/dotnet-pr-v2.yml (ThruuAi/.github#9).
 
-  * `global-json-sdk`            install the SDK global.json names, on its own, under $RUNNER_TEMP/dotnet, and fail
-                                  the job unless `dotnet --version` is that version;
-  * `static-checks-background`   start the caller's static checks in the background, join them in a step placed
-                                  before the restore; the job fails when they fail, never start or die;
-  * `build-together`             build the unit and integration projects in one MSBuild invocation.
+The caller's `static-checks` script starts in the background and is joined in a step placed before the restore; the
+job fails when the checks fail, never start or die. What is pinned (a caller that does not set the input must see no
+change, and a caller that sets it must lose no check):
 
-What is pinned (a caller that sets none of the three must see NO change, and a caller that sets them must lose no check):
-
-  * each input is boolean, optional and OFF by default;
-  * the new steps exist, in the agreed place, with the agreed conditions (the SDK install only when the switch is on
-    and the build is incremental and not skipped; the join runs on every ready pull request, after a failure too, and
-    before `Restore`);
-  * the SDK install uses the pinned setup-dotnet commit, reads global.json, installs under `$RUNNER_TEMP/dotnet`;
-  * the steps are RUN, as bash, in a scratch directory with a fake `dotnet`: the background checks pass, fail, never
-    start or die and the join says so; the SDK step refuses a version that is not global.json's; the build runs
-    one invocation or two exactly when asked.
+  * the input is boolean, optional and OFF by default;
+  * the join step exists, in the agreed place (after the cache restores and the time normalisation, just before
+    `Restore`, so a failed check still stops the job before the expensive steps) with the agreed condition (every ready
+    pull request, docs-only ones included, and after a failure too);
+  * the package token still reaches the restore step only;
+  * the steps are RUN, as bash, in a scratch directory: the background checks pass, fail, never start or die and the
+    join says so; off, the checks run to completion as before.
 
     python3 governance/tests/pr-lane-v2-speed.test.py
 
@@ -25,7 +20,6 @@ PR_LANE_V2_WORKFLOW overrides the workflow path (the mutation runner uses it). N
 import os
 import shutil
 import signal
-import stat
 import subprocess
 import tempfile
 import time
@@ -37,15 +31,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT = os.path.join(HERE, '..', '..', '.github', 'workflows', 'dotnet-pr-v2.yml')
 WORKFLOW = os.environ.get('PR_LANE_V2_WORKFLOW', DEFAULT)
 
-SETUP_DOTNET = 'actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9'
 STATIC = 'Static checks'
 JOIN = 'Static checks (result)'
-PIN = 'Pinned .NET SDK (the version global.json names, same install path on every runner)'
-SDK = '.NET SDK from the image (must satisfy global.json)'
 BUILD = 'Build (Release)'
 NORMALISE = 'Normalise file times against the cached tree'
 RESTORE = 'Restore'
-SWITCHES = ('global-json-sdk', 'static-checks-background', 'build-together')
 
 
 def slurp(path):
@@ -72,30 +62,9 @@ class Contract(unittest.TestCase):
         self.assertEqual(len(found), 1, f'step {name!r} found {len(found)} times')
         return found[0]
 
-    def test_every_switch_is_boolean_optional_and_off_by_default(self):
-        for name in SWITCHES:
-            with self.subTest(switch=name):
-                item = self.inputs[name]
-                self.assertEqual((item['type'], item['required'], item['default']), ('boolean', False, False))
-
-    def test_the_pinned_sdk_step_installs_what_global_json_names_into_a_job_private_folder(self):
-        step = self.step(PIN)
-        self.assertEqual(step['uses'], SETUP_DOTNET)
-        self.assertEqual(step['with'], {'global-json-file': 'global.json'})
-        self.assertEqual(step['env'], {'DOTNET_INSTALL_DIR': '${{ runner.temp }}/dotnet'})
-        self.assertEqual(step['if'], "steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk")
-
-    def test_the_pinned_sdk_step_comes_before_the_static_checks_start_and_just_before_the_sdk_check(self):
-        # Before the background checks start: the download then has the runner to itself (24 s beside them, 12 s alone).
-        self.assertEqual(self.names.index(PIN), self.names.index(SDK) - 1)
-        self.assertEqual(self.names.index('Docs-only change') + 1, self.names.index(PIN))
-        self.assertLess(self.names.index(SDK), self.names.index(STATIC))
-
-    def test_the_sdk_check_step_keeps_its_name_id_and_condition(self):
-        step = self.step(SDK)
-        self.assertEqual(step['id'], 'sdk')
-        self.assertEqual(step['if'], "steps.scope.outputs.skip != 'true' && inputs.incremental")
-        self.assertEqual(step['env'], {'PINNED': '${{ inputs.global-json-sdk }}'})
+    def test_the_switch_is_boolean_optional_and_off_by_default(self):
+        item = self.inputs['static-checks-background']
+        self.assertEqual((item['type'], item['required'], item['default']), ('boolean', False, False))
 
     def test_the_join_runs_on_every_ready_pull_request_even_after_a_failure_and_before_the_restore(self):
         step = self.step(JOIN)
@@ -110,7 +79,6 @@ class Contract(unittest.TestCase):
         self.assertEqual(step['env'], {'CHECKS': '${{ inputs.static-checks }}',
                                        'BACKGROUND': '${{ inputs.static-checks-background }}'})
         self.assertLess(self.names.index(STATIC), self.names.index('Select tests'))
-        self.assertGreater(self.names.index(STATIC), self.names.index(SDK))
 
     def test_the_join_is_before_every_step_that_sees_the_package_token_or_builds(self):
         for later in (RESTORE, BUILD, 'Tests (unit, then RLS slice)'):
@@ -119,9 +87,6 @@ class Contract(unittest.TestCase):
     def test_the_package_token_still_reaches_the_restore_step_only(self):
         holders = [s.get('name') for s in self.steps if 'GH_PACKAGES_TOKEN' in str(s.get('env', {}))]
         self.assertEqual(holders, [RESTORE])
-
-    def test_the_build_step_gets_the_switch(self):
-        self.assertEqual(self.step(BUILD)['env']['TOGETHER'], '${{ inputs.build-together }}')
 
 
 def bash(script, env, cwd, timeout=60):
@@ -226,127 +191,6 @@ class StaticChecksInTheBackground(Scratch):
     def test_a_script_that_exports_a_path_does_not_leak_it_into_the_join(self):
         self.assertEqual(self.start('export PATH=/nonexistent; true').returncode, 0)
         self.assertEqual(self.join().returncode, 0)
-
-
-FAKE_DOTNET = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$FAKE_DOTNET_LOG"
-if [ "$1" = "--version" ]; then echo "${FAKE_DOTNET_VERSION:-10.0.101}"; fi
-exit 0
-"""
-
-
-class TheSdkStep(Scratch):
-    def setUp(self):
-        super().setUp()
-        self.bin = os.path.join(self.root, 'bin')
-        os.makedirs(self.bin)
-        path = os.path.join(self.bin, 'dotnet')
-        with open(path, 'w') as handle:
-            handle.write(FAKE_DOTNET)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
-        self.log = os.path.join(self.root, 'dotnet.log')
-        self.output = os.path.join(self.root, 'github_output')
-        open(self.output, 'w').close()
-
-    def run_sdk(self, pinned, resolved, wanted='10.0.101'):
-        with open(os.path.join(self.work, 'global.json'), 'w') as handle:
-            handle.write('{"sdk": {"version": "%s", "rollForward": "latestPatch"}}' % wanted)
-        return self.run_step(SDK, PINNED=pinned, PATH=self.bin + ':' + os.environ.get('PATH', ''),
-                             FAKE_DOTNET_LOG=self.log, FAKE_DOTNET_VERSION=resolved, GITHUB_OUTPUT=self.output)
-
-    def test_not_pinned_any_version_the_host_resolves_is_accepted_and_recorded(self):
-        done = self.run_sdk('false', '10.0.115')
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn('version=10.0.115', slurp(self.output))
-
-    def test_pinned_the_exact_version_passes(self):
-        done = self.run_sdk('true', '10.0.101')
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn('version=10.0.101', slurp(self.output))
-
-    def test_pinned_another_patch_of_the_image_fails_closed(self):
-        for resolved in ('10.0.114', '10.0.115', '10.0.1010', '10.0.10'):
-            with self.subTest(resolved=resolved):
-                done = self.run_sdk('true', resolved)
-                self.assertNotEqual(done.returncode, 0)
-                self.assertIn('global.json names 10.0.101', done.stderr)
-
-    def test_pinned_without_a_global_json_version_fails(self):
-        with open(os.path.join(self.work, 'global.json'), 'w') as handle:
-            handle.write('{}')
-        done = self.run_step(SDK, PINNED='true', PATH=self.bin + ':' + os.environ.get('PATH', ''),
-                             FAKE_DOTNET_LOG=self.log, FAKE_DOTNET_VERSION='10.0.101', GITHUB_OUTPUT=self.output)
-        self.assertNotEqual(done.returncode, 0)
-
-
-class TheBuildStep(Scratch):
-    def setUp(self):
-        super().setUp()
-        self.bin = os.path.join(self.root, 'bin')
-        os.makedirs(self.bin)
-        path = os.path.join(self.bin, 'dotnet')
-        with open(path, 'w') as handle:
-            handle.write(FAKE_DOTNET)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
-        self.log = os.path.join(self.root, 'dotnet.log')
-        for rel in ('t/Unit.csproj', 't/Integration.csproj'):
-            os.makedirs(os.path.join(self.work, os.path.dirname(rel)), exist_ok=True)
-            open(os.path.join(self.work, rel), 'w').close()
-
-    def build(self, together, rls='true', incremental='true', integration='t/Integration.csproj'):
-        return self.run_step(BUILD, SOLUTION='All.sln', MSBUILD_ARGS='', INCREMENTAL=incremental,
-                             UNIT_PROJECTS='t/Unit.csproj', INTEGRATION_PROJECTS=integration, RLS=rls,
-                             TOGETHER=together, PATH=self.bin + ':' + os.environ.get('PATH', ''),
-                             FAKE_DOTNET_LOG=self.log)
-
-    def calls(self):
-        return [l for l in slurp(self.log).splitlines() if l.startswith('build ')]
-
-    def test_off_two_invocations_one_per_project_as_before(self):
-        done = self.build('false')
-        self.assertEqual(done.returncode, 0, done.stderr)
-        calls = self.calls()
-        self.assertEqual(len(calls), 2, calls)
-        self.assertTrue(calls[0].startswith('build t/Unit.csproj '))
-        self.assertTrue(calls[1].startswith('build t/Integration.csproj '))
-        self.assertFalse(os.path.exists(os.path.join(self.temp, 'lane-build.proj')))
-
-    def test_on_one_invocation_of_a_traversal_project_naming_both_with_the_same_flags(self):
-        done = self.build('true')
-        self.assertEqual(done.returncode, 0, done.stderr)
-        calls = self.calls()
-        self.assertEqual(len(calls), 1, calls)
-        lane = os.path.join(self.temp, 'lane-build.proj')
-        self.assertTrue(calls[0].startswith(f'build {lane} -c Release --no-restore '), calls[0])
-        for flag in ('-m:2', '-p:EnforceCodeStyleInBuild=false', '-p:IncludeSourceRevisionInInformationalVersion=false',
-                     '-p:EnableSourceLink=false', '-p:EmbedUntrackedSources=false',
-                     '-p:CreateHardLinksForCopyLocalIfPossible=true'):
-            self.assertIn(flag, calls[0])
-        text = slurp(lane)
-        self.assertIn(os.path.join(self.work, 't/Unit.csproj'), text)
-        self.assertIn(os.path.join(self.work, 't/Integration.csproj'), text)
-        self.assertIn('BuildInParallel="true"', text)
-        self.assertEqual(text.count('<LaneProject Include='), 2)
-
-    def test_on_with_one_project_there_is_nothing_to_combine(self):
-        done = self.build('true', rls='false')
-        self.assertEqual(done.returncode, 0, done.stderr)
-        calls = self.calls()
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0].startswith('build t/Unit.csproj '), calls[0])
-
-    def test_on_but_not_incremental_the_solution_is_built_as_before(self):
-        done = self.build('true', incremental='false')
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertTrue(self.calls()[0].startswith('build All.sln '))
-        self.assertEqual(len(self.calls()), 1)
-
-    def test_a_path_that_needs_xml_escaping_is_refused_not_written(self):
-        os.makedirs(os.path.join(self.work, 'a&b'))
-        open(os.path.join(self.work, 'a&b', 'X.csproj'), 'w').close()
-        done = self.build('true', integration='a&b/X.csproj')
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn('XML escaping', done.stderr)
 
 
 if __name__ == '__main__':

@@ -34,22 +34,12 @@
 # on a GitHub-hosted ubuntu-24.04 runner it is /home/runner/work/_temp for every job. A caller's `env:` is not
 # passed into a called workflow, so only this file can set the folders.
 #
-# THREE MORE OPT-IN SWITCHES, all OFF by default, each a time saver and none removes a check (ThruuAi/.github#9;
+# ONE MORE OPT-IN SWITCH, OFF by default, a time saver that removes no check (ThruuAi/.github#9;
 # measured on omni237's `pr / ci`, https://github.com/ThruuAi/omni237/issues/4978):
-#   * `global-json-sdk`: install, into $RUNNER_TEMP/dotnet, exactly the SDK the caller's global.json names, and use only
-#     that one. The restored obj/ is reusable only when it was built with the SAME SDK at the same path (the SDK's
-#     targeting pack and analyzers are compile inputs, so another patch recompiles every project). The hosted image
-#     carries a different SDK patch on different machines during a roll (10.0.114 and 10.0.115 side by side for days),
-#     so a lane that takes "whatever the image has" restores a compiled output built with the other one, or an old one
-#     of its own. The caller's producer workflow (omni237 dev-compile.yml) does the same install, so both always build
-#     with the version in global.json. Cost: one SDK download, about 12 s (measured), instead of the image's SDK, 3 s.
 #   * `static-checks-background`: start the `static-checks` script in the background (its output goes to a file) and
 #     join it in `Static checks (result)` just before the restore, so the checks run while the NuGet cache downloads.
 #     The result step fails the job if the script failed, never started, or died without a result, and on a
 #     timeout; the log is printed there, so annotations and groups appear as before.
-#   * `build-together`: build the unit and the integration projects in ONE MSBuild invocation (a generated
-#     traversal project that builds them with BuildInParallel) instead of one `dotnet build` after the other, so the
-#     second project's own compile runs beside the first's on the runner's second core.
 #
 # SECURITY. Read-only token. The package-feed secret reaches the RESTORE step only,
 # so the build and the tests of the pull request's own code run without it. Nothing
@@ -148,28 +138,11 @@ on:
         type: boolean
         required: false
         default: false
-      global-json-sdk:
-        description: >-
-          With `incremental`: install exactly the SDK version global.json names (setup-dotnet, into
-          $RUNNER_TEMP/dotnet, so it is the only SDK the job can resolve) instead of using the runner image's, and
-          fail the job unless `dotnet --version` is that version. Set it when the caller's producer workflow builds
-          the cached obj/ with the same install: the cache is keyed by the SDK version and is reusable only when
-          producer and lane used the same SDK at the same path. Default false: the image's SDK, as before.
-        type: boolean
-        required: false
-        default: false
       static-checks-background:
         description: >-
           Start `static-checks` in the background and join it in the `Static checks (result)` step, just before the
           restore, so the checks overlap the NuGet cache download. The job still fails when they fail, never
           start, or end without a result. Default false: the checks run to completion first, as before.
-        type: boolean
-        required: false
-        default: false
-      build-together:
-        description: >-
-          With `incremental`: build the unit and integration projects in one MSBuild invocation (a generated
-          traversal project, BuildInParallel) instead of one `dotnet build` after the other. Default false.
         type: boolean
         required: false
         default: false
@@ -255,39 +228,6 @@ jobs:
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
-      # `global-json-sdk` (first, BEFORE the static checks start, so the download has the runner to itself: with the
-      # background checks running beside it the same install took 24 s instead of 12): the SDK global.json names, installed on its own under $RUNNER_TEMP/dotnet (setup-dotnet
-      # adds it to PATH and sets DOTNET_ROOT, and the `dotnet` host only sees the SDKs beside it, so this is the one
-      # SDK every later step resolves). The path is the same on every runner, like the NuGet folder above.
-      - name: Pinned .NET SDK (the version global.json names, same install path on every runner)
-        if: steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
-        env:
-          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
-        with:
-          global-json-file: global.json
-
-      # Without `global-json-sdk` the runner image carries the SDK (global.json says latestPatch of 10.0.101 and the
-      # image ships a newer 10.0.x; a roll of the image changes the patch). Fail closed if the image has none. With it,
-      # the version must be exactly the one global.json names.
-      - name: .NET SDK from the image (must satisfy global.json)
-        if: steps.scope.outputs.skip != 'true' && inputs.incremental
-        id: sdk
-        env:
-          PINNED: ${{ inputs.global-json-sdk }}
-        run: |
-          set -euo pipefail
-          v="$(dotnet --version)"      # resolves global.json; fails when no installed SDK satisfies it
-          if [ "$PINNED" = "true" ]; then
-            want="$(python3 -c 'import json; print(json.load(open("global.json"))["sdk"]["version"])')"
-            if [ "$v" != "$want" ]; then
-              echo "FAIL global-json-sdk: dotnet resolves $v but global.json names $want" >&2
-              exit 1
-            fi
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "SDK $v"
-
       # Runs on docs-only changes too: the secret scan must see a token pasted into a .md file
       # (review pr-lane-v2-r1 note 2). It costs seconds.
       - name: Static checks
@@ -302,7 +242,8 @@ jobs:
           fi
           # In the background (see `static-checks-background`): detached, every stream on a file, so this step ends
           # at once and the runner does not wait for it. The wrapper records its own pid first, and writes the exit
-          # status to `rc` only when the script is done (rename, so `rc` is never half-written).
+          # status to `rc` only when the script is done (rename, so `rc` is never half-written). `nice`: the checks use
+          # the cores the NuGet download and extraction leave free instead of slowing them.
           set -euo pipefail
           dir="$RUNNER_TEMP/static-checks-bg"
           rm -rf "$dir"; mkdir -p "$dir"
@@ -310,7 +251,7 @@ jobs:
           # `setsid` (util-linux, on every hosted runner) puts it in a session of its own; where it is missing (a
           # Mac running these tests) the plain background job is used.
           detach=(); if command -v setsid > /dev/null; then detach=(setsid); fi
-          "${detach[@]}" nohup bash -c 'echo $$ > "$1/pid"; bash -euo pipefail "$1/checks.sh" > "$1/log" 2>&1; echo $? > "$1/rc.tmp"; mv "$1/rc.tmp" "$1/rc"' _ "$dir" > /dev/null 2>&1 < /dev/null &
+          "${detach[@]}" nice -n 10 nohup bash -c 'echo $$ > "$1/pid"; bash -euo pipefail "$1/checks.sh" > "$1/log" 2>&1; echo $? > "$1/rc.tmp"; mv "$1/rc.tmp" "$1/rc"' _ "$dir" > /dev/null 2>&1 < /dev/null &
           echo "static checks started in the background; the result is joined before the restore"
 
       # What does this change need? Runs the BASE's copy of the selector. Any problem: everything.
@@ -338,6 +279,17 @@ jobs:
           else
             all "selector failed"
           fi
+
+      # The runner image carries the SDK (global.json says latestPatch of 10.0.101 and the image ships a
+      # newer 10.0.x); installing 10.0.101 on top costs ~12 s per run. Fail closed if the image has none.
+      - name: .NET SDK from the image (must satisfy global.json)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        id: sdk
+        run: |
+          set -euo pipefail
+          v="$(dotnet --version)"      # resolves global.json; fails when no installed SDK satisfies it
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "SDK $v"
 
       - name: Setup .NET (SDK from global.json, NuGet cache)
         if: steps.scope.outputs.skip != 'true' && !inputs.incremental
@@ -464,7 +416,6 @@ jobs:
           UNIT_PROJECTS: ${{ inputs.unit-projects }}
           INTEGRATION_PROJECTS: ${{ inputs.integration-projects }}
           RLS: ${{ steps.select.outputs.rls }}
-          TOGETHER: ${{ inputs.build-together }}
         run: |
           set -euo pipefail
           read -r -a extra <<< "$MSBUILD_ARGS"
@@ -480,26 +431,9 @@ jobs:
             # the same predicate as the test step: anything but an explicit `false` builds what the slice needs
             if [ "$RLS" = "false" ]; then INTEGRATION_PROJECTS=""; fi
             mapfile -t targets < <(words "$UNIT_PROJECTS"$'\n'"$INTEGRATION_PROJECTS")
-            if [ "$TOGETHER" = "true" ] && [ "${#targets[@]}" -gt 1 ]; then
-              # `build-together`: one MSBuild invocation for all the test projects. A traversal project in
-              # $RUNNER_TEMP (outside the checkout, so no repository props apply to it) builds each of them with the
-              # same global properties; a project they share is built once, and independent ones run in parallel.
-              lane="$RUNNER_TEMP/lane-build.proj"
-              { printf '<Project>\n  <ItemGroup>\n'
-                for t in "${targets[@]}"; do
-                  full="$(realpath "$t")"
-                  case "$full" in *[\<\>\&\"\']*) echo "FAIL build-together: '$full' has a character that needs XML escaping" >&2; exit 1 ;; esac
-                  printf '    <LaneProject Include="%s" />\n' "$full"
-                done
-                printf '  </ItemGroup>\n  <Target Name="Build">\n    <MSBuild Projects="@(LaneProject)" Targets="Build" BuildInParallel="true" />\n  </Target>\n</Project>\n'
-              } > "$lane"
-              targets=("$lane")
-            fi
           fi
           for t in "${targets[@]}"; do
-            started=$SECONDS
             dotnet build "$t" -c Release --no-restore --nologo -v q -p:EnforceCodeStyleInBuild=false "${flags[@]}" "${extra[@]}"
-            echo "built $t in $((SECONDS - started)) s"
           done
 
       # Style and whitespace on the changed files only, against the base (HEAD^1 of the merge commit).

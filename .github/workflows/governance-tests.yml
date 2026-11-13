@@ -57,9 +57,9 @@ jobs:
         run: python3 governance/tests/pr-lane-v2-workflow.test.py
       - name: PR lane v2 workflow, mutation proof
         run: python3 governance/tests/pr-lane-v2-workflow.mutations.py
-      - name: PR lane v2 speed switches (SDK pin, background static checks, one build)
+      - name: PR lane v2 static checks in the background
         run: python3 governance/tests/pr-lane-v2-speed.test.py
-      - name: PR lane v2 speed switches, mutation proof
+      - name: PR lane v2 static checks in the background, mutation proof
         run: python3 governance/tests/pr-lane-v2-speed.mutations.py
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
