@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation proof for pr-lane-v2-speed.test.py (the `static-checks-background` input).
+"""Mutation proof for pr-lane-v2-speed.test.py.
 
 Each mutant weakens .github/workflows/dotnet-pr-v2.yml in one way a careless edit could, in a COPY
 (PR_LANE_V2_WORKFLOW), and the suite must go red on it. The real file is never written: its SHA-256 is compared
@@ -43,10 +43,36 @@ def move_join_after_build(text):
     return text.replace(marker, block + marker), None
 
 
+def move_sdk_after_static(text):
+    start = text.index('      # `global-json-sdk` (first')
+    end = text.index('      # Runs on docs-only changes too')
+    block = text[start:end]
+    text = text[:start] + text[end:]
+    marker = '      # What does this change need?'
+    if text.count(marker) != 1:
+        return None, 'the selector anchor is not unique'
+    return text.replace(marker, block + marker), None
+
+
+INSTALL_IF = "        if: steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk\n"
 JOIN_IF = "        if: ${{ !cancelled() && inputs.static-checks != '' && inputs.static-checks-background }}\n"
 SWITCH_DEFAULT = "        type: boolean\n        required: false\n        default: false\n"
 
 MUTANTS = [
+    ('the SDK install no longer needs the switch (every caller gets it)',
+     sub(INSTALL_IF, "        if: steps.scope.outputs.skip != 'true' && inputs.incremental\n")),
+    ('the SDK install runs on a docs-only change too',
+     sub(INSTALL_IF, "        if: inputs.incremental && inputs.global-json-sdk\n")),
+    ('the SDK is installed into the image folder, not a job-private one',
+     sub("DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet", "DOTNET_INSTALL_DIR: /usr/share/dotnet")),
+    ('the SDK install ignores global.json (a literal version)',
+     sub("        with:\n          global-json-file: global.json\n\n      # Without", "        with:\n          dotnet-version: 10.0.115\n\n      # Without")),
+    ('the version check no longer compares with global.json',
+     sub('            if [ "$v" != "$want" ]; then', '            if false; then')),
+    ('the version check accepts any 10.0.x',
+     sub('            if [ "$v" != "$want" ]; then', '            if [ "${v%.*}" != "${want%.*}" ]; then')),
+    ('the version check reads the switch wrongly (never checks)',
+     sub('          if [ "$PINNED" = "true" ]; then', '          if [ "$PINNED" = "never" ]; then')),
     ('the join step is dropped',
      lambda t: (t[:t.index('      # The join of `static-checks-background`')] + t[t.index('      # The ONLY step that sees the package token.'):], None)),
     ('the join no longer runs after a failure or when docs-only (default success() only)',
@@ -55,6 +81,7 @@ MUTANTS = [
      sub(JOIN_IF, "        if: ${{ !cancelled() && steps.scope.outputs.skip != 'true' && inputs.static-checks-background }}\n")),
     ('the join runs even when the switch is off',
      sub(JOIN_IF, "        if: ${{ !cancelled() && inputs.static-checks != '' }}\n")),
+    ('the SDK install runs after the static checks started (the download shares the runner with them)', move_sdk_after_static),
     ('the join sits after the build (a failed check no longer stops the expensive steps)', move_join_after_build),
     ('the join ignores a non-zero exit status of the checks',
      sub('          if [ "$rc" != "0" ]; then\n            echo "::error::the static checks failed (exit status $rc)"\n            exit 1\n          fi\n', '')),
@@ -78,6 +105,9 @@ MUTANTS = [
     ('the background switch defaults to true',
      sub("      static-checks-background:\n        description: >-\n          Start `static-checks` in the background and join it in the `Static checks (result)` step, just before the\n          restore, so the checks overlap the NuGet cache download. The job still fails when they fail, never\n          start, or end without a result. Default false: the checks run to completion first, as before.\n" + SWITCH_DEFAULT,
          "      static-checks-background:\n        description: >-\n          x\n        type: boolean\n        required: false\n        default: true\n")),
+    ('the SDK switch defaults to true',
+     sub("          producer and lane used the same SDK at the same path. Default false: the image's SDK, as before.\n" + SWITCH_DEFAULT,
+         "          producer and lane used the same SDK at the same path. Default false: the image's SDK, as before.\n        type: boolean\n        required: false\n        default: true\n")),
 ]
 
 
