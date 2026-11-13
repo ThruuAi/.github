@@ -16,7 +16,9 @@ jobs:
     # Pin ahead of GitHub's ubuntu-latest migration (2026-10-19 to 2026-11-19):
     # https://github.blog/changelog/2026-09-17-ubuntu-26-generally-available-and-latest-migration/
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # 8 minutes: the job took about 190 s and the PR lane v2 proofs (ThruuAi/.github#9) add about 1.5 minutes on 2 cores;
+    # the first run of #10 hit the old 5 minute limit inside its mutation proof (run 43410741021, cancelled, not red).
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -57,6 +59,10 @@ jobs:
         run: python3 governance/tests/pr-lane-v2-workflow.test.py
       - name: PR lane v2 workflow, mutation proof
         run: python3 governance/tests/pr-lane-v2-workflow.mutations.py
+      - name: PR lane v2 speed switches (SDK pin, background static checks)
+        run: python3 governance/tests/pr-lane-v2-speed.test.py
+      - name: PR lane v2 speed switches, mutation proof
+        run: python3 governance/tests/pr-lane-v2-speed.mutations.py
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
       - name: identity manifests parse

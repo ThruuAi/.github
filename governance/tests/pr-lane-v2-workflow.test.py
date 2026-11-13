@@ -64,13 +64,15 @@ STEP_NAMES = [
     'Fail unless the NuGet locations are job-owned',
     'Checkout (the pull request merged into its base)',
     'Docs-only change',
+    'Pinned .NET SDK (the version global.json names, same install path on every runner)',
+    '.NET SDK from the image (must satisfy global.json)',
     'Static checks',
     'Select tests',
-    '.NET SDK from the image (must satisfy global.json)',
     'Setup .NET (SDK from global.json, NuGet cache)',
     'NuGet packages (restore from the dev cache)',
     'Compiled output (restore obj/ from dev)',
     'Normalise file times against the cached tree',
+    'Static checks (result)',
     'Restore',
     'Build (Release)',
     'Code style (changed files)',
@@ -119,7 +121,7 @@ class Contract(unittest.TestCase):
         self.assertEqual((item['type'], item['required'], item['default']), ('boolean', False, False))
 
     def test_every_existing_input_keeps_its_type_requiredness_and_default(self):
-        self.assertEqual(set(self.inputs), set(EXISTING_INPUTS) | {'job-private-nuget'})
+        self.assertEqual(set(self.inputs), set(EXISTING_INPUTS) | {'job-private-nuget', 'global-json-sdk', 'static-checks-background'})
         for name, (kind, required, default) in EXISTING_INPUTS.items():
             with self.subTest(input=name):
                 item = self.inputs[name]

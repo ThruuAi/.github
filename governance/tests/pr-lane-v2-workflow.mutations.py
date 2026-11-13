@@ -54,6 +54,12 @@ def export_after_checkout(text):
     return text.replace(marker, EXPORT_STEP + marker), None
 
 
+def drop_static_step(text):
+    start = text.index('      - name: Static checks\n')
+    end = text.index('      # What does this change need?')
+    return text[:start] + text[end:], None
+
+
 MUTANTS = [
     ('the export step is removed', lambda t: nth(t, EXPORT_STEP, '', 0, 1)),
     ('the export runs AFTER the checkout', export_after_checkout),
@@ -82,15 +88,14 @@ MUTANTS = [
      lambda t: nth(t, "key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}",
                    "key: nuget-v2-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}", 0, 1)),
     ('the input defaults to true',
-     lambda t: nth(t, "        type: boolean\n        required: false\n        default: false\n      timeout-minutes:",
-                   "        type: boolean\n        required: false\n        default: true\n      timeout-minutes:", 0, 1)),
+     lambda t: nth(t, "        type: boolean\n        required: false\n        default: false\n      global-json-sdk:",
+                   "        type: boolean\n        required: false\n        default: true\n      global-json-sdk:", 0, 1)),
     ('the input becomes required',
-     lambda t: nth(t, "        type: boolean\n        required: false\n        default: false\n      timeout-minutes:",
-                   "        type: boolean\n        required: true\n        default: false\n      timeout-minutes:", 0, 1)),
+     lambda t: nth(t, "        type: boolean\n        required: false\n        default: false\n      global-json-sdk:",
+                   "        type: boolean\n        required: true\n        default: false\n      global-json-sdk:", 0, 1)),
     ('the job env sets NUGET_PACKAGES for every caller',
      lambda t: nth(t, '      MSBUILDDISABLENODEREUSE: "1"\n', '      MSBUILDDISABLENODEREUSE: "1"\n      NUGET_PACKAGES: /home/runner/.nuget/packages\n', 0, 1)),
-    ('the static checks step is dropped',
-     lambda t: nth(t, "      - name: Static checks\n        if: inputs.static-checks != ''\n        env:\n          CHECKS: ${{ inputs.static-checks }}\n        run: bash -euo pipefail -c \"$CHECKS\"\n\n", '', 0, 1)),
+    ('the static checks step is dropped', drop_static_step),
     ('the package token moves to the job env (reaches build and tests)',
      lambda t: nth(t, '      MSBUILDDISABLENODEREUSE: "1"\n', '      MSBUILDDISABLENODEREUSE: "1"\n      GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}\n', 0, 1)),
     ('the runner default changes',
