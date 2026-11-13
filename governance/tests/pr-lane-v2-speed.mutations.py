@@ -43,6 +43,17 @@ def move_join_after_build(text):
     return text.replace(marker, block + marker), None
 
 
+def move_sdk_after_static(text):
+    start = text.index('      # `global-json-sdk` (first')
+    end = text.index('      # Runs on docs-only changes too')
+    block = text[start:end]
+    text = text[:start] + text[end:]
+    marker = '      # What does this change need?'
+    if text.count(marker) != 1:
+        return None, 'the selector anchor is not unique'
+    return text.replace(marker, block + marker), None
+
+
 INSTALL_IF = "        if: steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk\n"
 JOIN_IF = "        if: ${{ !cancelled() && inputs.static-checks != '' && inputs.static-checks-background }}\n"
 SWITCH_DEFAULT = "        type: boolean\n        required: false\n        default: false\n"
@@ -70,6 +81,7 @@ MUTANTS = [
      sub(JOIN_IF, "        if: ${{ !cancelled() && steps.scope.outputs.skip != 'true' && inputs.static-checks-background }}\n")),
     ('the join runs even when the switch is off',
      sub(JOIN_IF, "        if: ${{ !cancelled() && inputs.static-checks != '' }}\n")),
+    ('the SDK install runs after the static checks started (the download shares the runner with them)', move_sdk_after_static),
     ('the join sits after the build (a failed check no longer stops the expensive steps)', move_join_after_build),
     ('the join ignores a non-zero exit status of the checks',
      sub('          if [ "$rc" != "0" ]; then\n            echo "::error::the static checks failed (exit status $rc)"\n            exit 1\n          fi\n', '')),

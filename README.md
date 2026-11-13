@@ -144,7 +144,7 @@ pinned file). One job named `ci`, so a caller job named `pr` produces the check 
    * `build-together`: the unit and the integration projects build in one MSBuild invocation (a traversal project
      generated in `$RUNNER_TEMP`, `BuildInParallel`) instead of one `dotnet build` after the other, with the same flags.
    `governance/tests/pr-lane-v2-speed.test.py` pins the inputs, the step order and conditions and runs the steps as bash
-   with a fake `dotnet`; `pr-lane-v2-speed.mutations.py` proves 30 weakenings red.
+   with a fake `dotnet`; `pr-lane-v2-speed.mutations.py` proves 31 weakenings red.
 
 Trust: the selector and the time normaliser run from the base, never from the pull request head, and a
 pull request that edits them changes `.github/**`, which the selector treats as "run everything". The

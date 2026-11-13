@@ -255,6 +255,39 @@ jobs:
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
+      # `global-json-sdk` (first, BEFORE the static checks start, so the download has the runner to itself: with the
+      # background checks running beside it the same install took 24 s instead of 12): the SDK global.json names, installed on its own under $RUNNER_TEMP/dotnet (setup-dotnet
+      # adds it to PATH and sets DOTNET_ROOT, and the `dotnet` host only sees the SDKs beside it, so this is the one
+      # SDK every later step resolves). The path is the same on every runner, like the NuGet folder above.
+      - name: Pinned .NET SDK (the version global.json names, same install path on every runner)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          global-json-file: global.json
+
+      # Without `global-json-sdk` the runner image carries the SDK (global.json says latestPatch of 10.0.101 and the
+      # image ships a newer 10.0.x; a roll of the image changes the patch). Fail closed if the image has none. With it,
+      # the version must be exactly the one global.json names.
+      - name: .NET SDK from the image (must satisfy global.json)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        id: sdk
+        env:
+          PINNED: ${{ inputs.global-json-sdk }}
+        run: |
+          set -euo pipefail
+          v="$(dotnet --version)"      # resolves global.json; fails when no installed SDK satisfies it
+          if [ "$PINNED" = "true" ]; then
+            want="$(python3 -c 'import json; print(json.load(open("global.json"))["sdk"]["version"])')"
+            if [ "$v" != "$want" ]; then
+              echo "FAIL global-json-sdk: dotnet resolves $v but global.json names $want" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "SDK $v"
+
       # Runs on docs-only changes too: the secret scan must see a token pasted into a .md file
       # (review pr-lane-v2-r1 note 2). It costs seconds.
       - name: Static checks
@@ -305,38 +338,6 @@ jobs:
           else
             all "selector failed"
           fi
-
-      # `global-json-sdk`: the SDK global.json names, installed on its own under $RUNNER_TEMP/dotnet (setup-dotnet
-      # adds it to PATH and sets DOTNET_ROOT, and the `dotnet` host only sees the SDKs beside it, so this is the one
-      # SDK every later step resolves). The path is the same on every runner, like the NuGet folder above.
-      - name: Pinned .NET SDK (the version global.json names, same install path on every runner)
-        if: steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
-        env:
-          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
-        with:
-          global-json-file: global.json
-
-      # Without `global-json-sdk` the runner image carries the SDK (global.json says latestPatch of 10.0.101 and the
-      # image ships a newer 10.0.x; a roll of the image changes the patch). Fail closed if the image has none. With it,
-      # the version must be exactly the one global.json names.
-      - name: .NET SDK from the image (must satisfy global.json)
-        if: steps.scope.outputs.skip != 'true' && inputs.incremental
-        id: sdk
-        env:
-          PINNED: ${{ inputs.global-json-sdk }}
-        run: |
-          set -euo pipefail
-          v="$(dotnet --version)"      # resolves global.json; fails when no installed SDK satisfies it
-          if [ "$PINNED" = "true" ]; then
-            want="$(python3 -c 'import json; print(json.load(open("global.json"))["sdk"]["version"])')"
-            if [ "$v" != "$want" ]; then
-              echo "FAIL global-json-sdk: dotnet resolves $v but global.json names $want" >&2
-              exit 1
-            fi
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "SDK $v"
 
       - name: Setup .NET (SDK from global.json, NuGet cache)
         if: steps.scope.outputs.skip != 'true' && !inputs.incremental

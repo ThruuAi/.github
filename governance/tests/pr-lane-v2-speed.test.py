@@ -85,9 +85,11 @@ class Contract(unittest.TestCase):
         self.assertEqual(step['env'], {'DOTNET_INSTALL_DIR': '${{ runner.temp }}/dotnet'})
         self.assertEqual(step['if'], "steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk")
 
-    def test_the_pinned_sdk_step_comes_after_the_selector_and_before_the_sdk_check(self):
+    def test_the_pinned_sdk_step_comes_before_the_static_checks_start_and_just_before_the_sdk_check(self):
+        # Before the background checks start: the download then has the runner to itself (24 s beside them, 12 s alone).
         self.assertEqual(self.names.index(PIN), self.names.index(SDK) - 1)
-        self.assertLess(self.names.index('Select tests'), self.names.index(PIN))
+        self.assertEqual(self.names.index('Docs-only change') + 1, self.names.index(PIN))
+        self.assertLess(self.names.index(SDK), self.names.index(STATIC))
 
     def test_the_sdk_check_step_keeps_its_name_id_and_condition(self):
         step = self.step(SDK)
@@ -108,6 +110,7 @@ class Contract(unittest.TestCase):
         self.assertEqual(step['env'], {'CHECKS': '${{ inputs.static-checks }}',
                                        'BACKGROUND': '${{ inputs.static-checks-background }}'})
         self.assertLess(self.names.index(STATIC), self.names.index('Select tests'))
+        self.assertGreater(self.names.index(STATIC), self.names.index(SDK))
 
     def test_the_join_is_before_every_step_that_sees_the_package_token_or_builds(self):
         for later in (RESTORE, BUILD, 'Tests (unit, then RLS slice)'):
