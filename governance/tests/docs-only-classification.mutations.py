@@ -16,7 +16,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..', '..', '.github', 'workflows')
-NAMES = ('dotnet-pr.yml', 'dotnet-pr-v2.yml')
+NAMES = ('dotnet-pr.yml', 'dotnet-pr-v2.yml', 'dotnet-pr-v3.yml')
 TEST = os.path.join(HERE, 'docs-only-classification.test.py')
 
 PRISTINE = {n: open(os.path.join(ROOT, n), encoding='utf-8').read() for n in NAMES}

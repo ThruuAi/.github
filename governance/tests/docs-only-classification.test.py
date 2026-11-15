@@ -2,7 +2,7 @@
 """The "Docs-only change" step of dotnet-pr.yml and dotnet-pr-v2.yml must never call a pull request docs-only
 unless every changed file is (ThruuAi/.github#11, omni237#5473).
 
-The step is RUN, as bash, against a real git repository whose HEAD is a merge commit (the shape of a pull_request
+The step of dotnet-pr.yml, dotnet-pr-v2.yml and dotnet-pr-v3.yml is RUN, as bash, against a real git repository whose HEAD is a merge commit (the shape of a pull_request
 checkout: HEAD^1 the base tip, HEAD^2 the pull request head). The failure it pins: a file list longer than the
 64 KB pipe buffer made `printf | grep -q` die of a closed pipe, `pipefail` made the pipeline fail, and the step
 reported skip=true for a promotion of 1,411 files, so `pr / ci` was green without a build or a test.
@@ -22,7 +22,7 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..', '..', '.github', 'workflows')
 WORKFLOWS = os.environ.get('DOCS_ONLY_WORKFLOWS', os.pathsep.join(
-    os.path.join(ROOT, name) for name in ('dotnet-pr.yml', 'dotnet-pr-v2.yml'))).split(os.pathsep)
+    os.path.join(ROOT, name) for name in ('dotnet-pr.yml', 'dotnet-pr-v2.yml', 'dotnet-pr-v3.yml'))).split(os.pathsep)
 REGEX = r'^(docs/|docs-new/|website/|test-plan/)|\.md$'
 STEP = 'Docs-only change'
 
@@ -30,7 +30,7 @@ STEP = 'Docs-only change'
 def script(path):
     with open(path, encoding='utf-8') as handle:
         doc = yaml.safe_load(handle)
-    found = [s for s in doc['jobs']['ci']['steps'] if s.get('name') == STEP]
+    found = [s for job in ('ci', 'lane') if job in doc['jobs'] for s in doc['jobs'][job]['steps'] if s.get('name') == STEP]
     assert len(found) == 1, f'{path}: step {STEP!r} found {len(found)} times'
     return found[0]['run']
 
@@ -67,7 +67,7 @@ class Classification(unittest.TestCase):
     def skip(self, workflow, root, regex=REGEX, event='pull_request'):
         out = os.path.join(root, '.out')
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': root, 'EVENT': event,
-               'IGNORE_REGEX': regex, 'GITHUB_OUTPUT': out}
+               'IGNORE_REGEX': regex, 'GITHUB_OUTPUT': out}   # v3 computes IGNORE_REGEX in an expression; the script sees the value
         done = subprocess.run(['bash', '-e', '-c', script(workflow)], cwd=root, env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         values = dict(line.split('=', 1) for line in open(out).read().split())
