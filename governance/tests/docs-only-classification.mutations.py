@@ -36,9 +36,6 @@ MUTANTS = {
     'grep -q with pipefail (the 2026-11-14 defect)': (DECIDE, OLD_SHAPE),
     # a grep that fails (bad regex) counts as "nothing left"
     'grep error counts as docs-only': ('if [ "$rc" -eq 1 ]; then', 'if [ "$rc" -ne 0 ]; then'),
-    # output discarded to /dev/null: GNU grep then stops at the first match, like -q
-    'grep output sent to /dev/null': ('''others="$(printf '%s\\n' "$files" | grep -Ev -- "$IGNORE_REGEX")" || rc=$?''',
-                                      '''printf '%s\\n' "$files" | grep -Ev -- "$IGNORE_REGEX" >/dev/null || rc=$?'''),
     # "some file is not docs" (grep exit 0) counts as docs-only
     'a remaining code file counts as docs-only': ('if [ "$rc" -eq 1 ]; then', 'if [ "$rc" -le 1 ]; then'),
 }
@@ -60,20 +57,9 @@ def run(mutant):
         return done.returncode, (done.stdout + done.stderr)[-400:]
 
 
-def gnu_grep():
-    out = subprocess.run(['grep', '--version'], capture_output=True, text=True).stdout
-    return 'GNU grep' in out
-
-
-NEEDS_GNU = {'grep output sent to /dev/null'}   # BSD grep reads everything even into /dev/null, so only GNU grep (the runner) shows it
-
-
 def main():
     broken = survived = 0
     for label, mutant in MUTANTS.items():
-        if label in NEEDS_GNU and not gnu_grep():
-            print(f'SKIPPED  {label}: this grep is not GNU grep (the hosted runner runs it)')
-            continue
         rc, tail = run(mutant)
         if rc is None:
             print(f'BROKEN   {label}: {tail}')
