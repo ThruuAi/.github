@@ -129,10 +129,20 @@ jobs:
           # HEAD^2 the pull request head, so this diff is exactly what the pull request changes.
           if [ "$EVENT" = "pull_request" ] && [ -n "$IGNORE_REGEX" ] && git rev-parse -q --verify 'HEAD^2' >/dev/null; then
             files="$(git diff --name-only 'HEAD^1' HEAD)"
-            # grep -v keeps the files that do NOT match; none left means every file is ignorable.
-            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -Eqv -- "$IGNORE_REGEX"; then
-              skip=true
-              echo "Every changed file matches the docs-only pattern; nothing to build."
+            # grep -Ev prints the files that do NOT match and reads ALL of its input; its exit status says what is
+            # left: 1 = nothing left (every file is ignorable), 0 = some file is not, 2 or more = grep failed, which is
+            # NOT "docs only". Never `grep -q` here: it stops at the first hit, printf then dies on the closed pipe once
+            # the list passes the 64 KB pipe buffer (about 1,000 files), pipefail turns that into a failed pipeline, and a
+            # promotion of 1,411 files was classified docs-only and skipped every test (omni237#5473, ThruuAi/.github#11).
+            if [ -n "$files" ]; then
+              rc=0
+              # Captured, not sent to /dev/null: GNU grep stops at the first match when its output is /dev/null.
+              # shellcheck disable=SC2034  # captured only so that grep reads all of its input
+              others="$(printf '%s\n' "$files" | grep -Ev -- "$IGNORE_REGEX")" || rc=$?
+              if [ "$rc" -eq 1 ]; then
+                skip=true
+                echo "Every changed file matches the docs-only pattern; nothing to build."
+              fi
             fi
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"

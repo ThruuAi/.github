@@ -63,6 +63,10 @@ jobs:
         run: python3 governance/tests/pr-lane-v2-speed.test.py
       - name: PR lane v2 speed switches, mutation proof
         run: python3 governance/tests/pr-lane-v2-speed.mutations.py
+      - name: PR lane docs-only classification (a long file list is never docs-only)
+        run: python3 governance/tests/docs-only-classification.test.py
+      - name: PR lane docs-only classification, mutation proof
+        run: python3 governance/tests/docs-only-classification.mutations.py
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
       - name: identity manifests parse
