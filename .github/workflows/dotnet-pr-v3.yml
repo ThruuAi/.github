@@ -654,7 +654,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+        # The placeholder only keeps the expression valid when the plan was skipped (the dev gate); `if` then skips the job.
+        shard: ${{ fromJSON(needs.plan.outputs.matrix || '[{"label":"none","project":"","filter":""}]') }}
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
       DOTNET_NOLOGO: "1"

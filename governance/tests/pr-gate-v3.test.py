@@ -88,7 +88,8 @@ class Shape(unittest.TestCase):
         self.assertEqual(shard['needs'], 'plan')
         self.assertEqual(shard['if'], "${{ needs.plan.result == 'success' }}")
         self.assertIs(shard['strategy']['fail-fast'], False)
-        self.assertEqual(shard['strategy']['matrix'], {'shard': '${{ fromJSON(needs.plan.outputs.matrix) }}'})
+        self.assertEqual(list(shard['strategy']['matrix']), ['shard'])
+        self.assertTrue(shard['strategy']['matrix']['shard'].startswith('${{ fromJSON(needs.plan.outputs.matrix'))
 
     def test_the_package_token_reaches_a_restore_step_only(self):
         for job in ('lane', 'shard'):
