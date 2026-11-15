@@ -1,0 +1,878 @@
+# The PR gate for a .NET repository, v3: the gate a pull request meets depends on the branch it targets.
+#
+#   into dev    the lane (v2's single job: select the affected tests, restore, build the delta, run them), in about
+#               ten minutes. Everything else is the producer's and the later gates' job.
+#   into test   (and main) the lane running EVERYTHING it has (no selector, no docs-only skip), plus the repository's
+#               `shards-test` matrix of test shards that run beside it, so the whole gate fits twenty minutes.
+#   into uat    the same, with the repository's `shards-uat` matrix: the whole suite. What does not fit the test
+#               gate runs here; nothing is deleted (owner decision 2026-11-15, omni237#4974).
+#
+# THE CHECK. A ruleset requires `<caller job> / ci`. In v2 that was the one job; here it is the `ci` verdict job, which
+# runs ALWAYS (a skipped required check counts as passed, so a verdict that is skipped when the lane fails would let the
+# merge through) and is green only when the lane is green and, on a test, main or uat pull request, the plan produced
+# at least one shard and every shard is green. A matrix that selects no tests fails inside the shard (the TRX must
+# report a test), an empty or unreadable plan fails `plan`, and the verdict says so by name.
+#
+# WHAT THE SHARDS ARE. The caller names a command (`shards-test`, `shards-uat`) that prints the matrix as JSON:
+# [{"label", "project", "filter"}]. It runs in the `plan` job, from the merge checkout, without the package token. A
+# shard is a job of its own: it restores the same caches as the lane (NuGet, the dev producer's compiled output),
+# builds only its test project and runs its filter, so the shards run in parallel and the wall clock is the slowest
+# shard, not the sum.
+#
+# v3 is a separate file so v2 callers are untouched (v2 is the rollback). The lane job is v2's `ci` job with three
+# changes: it is named `lane`, a gate other than dev makes it run everything, and the code-style check is a dev-only
+# step (each dev pull request already checked the same files).
+#
+# Deliberately NOT here: a timeout or a failing check that enforces a duration (owner rule, 2026-11-12: the times are
+# design targets reached by splitting and moving work, never by cutting a run short; the safety `timeout-minutes` stay),
+# a custom trust gate, a budget, a load factor, a retry loop, a `workflow_run` fan-out. A red test is red.
+#
+# Everything the v2 header says about job-private NuGet folders, `global-json-sdk` and `static-checks-background` holds
+# unchanged for the lane and for the shards.
+#
+# SECURITY. Read-only token. The package-feed secret reaches the RESTORE steps only, so the build and the tests of the
+# pull request's own code run without it. Callers pin this file by commit SHA.
+name: dotnet-pr-v3
+
+on:
+  workflow_call:
+    inputs:
+      solution:
+        description: Path of the solution (or project) to restore and build.
+        type: string
+        required: true
+      unit-projects:
+        description: Test projects run in full, space or newline separated.
+        type: string
+        required: true
+      integration-projects:
+        description: >-
+          Test projects that take the integration filter, space or newline separated. In incremental mode
+          they are compiled and run only when the selector says the slice is needed (`rls` is not `false`).
+        type: string
+        required: false
+        default: ""
+      integration-filter:
+        description: >-
+          `dotnet test --filter` expression for the integration projects. Empty means no
+          integration tests run in this lane (Testcontainers is available on ubuntu-24.04).
+        type: string
+        required: false
+        default: ""
+      msbuild-args:
+        description: Extra MSBuild arguments for restore and build (for example -p:Name=value).
+        type: string
+        required: false
+        default: ""
+      docs-only-regex:
+        description: >-
+          Extended regex. When EVERY file changed by the pull request matches it, the job
+          reports success after the checkout and runs nothing else. The job still reports, so
+          a required check is never left pending (a workflow-level `paths-ignore` would).
+          Empty means never skip.
+        type: string
+        required: false
+        default: ""
+      static-checks:
+        description: >-
+          Shell script run from the repository root before the restore, for cheap static checks
+          (a secret scan). It runs without the package token and a non-zero exit fails the job.
+          Empty means none.
+        type: string
+        required: false
+        default: ""
+      format-verify:
+        description: >-
+          Run `dotnet format whitespace` in verify mode (folder mode, no project load) on only the .cs
+          files the pull request changed against its base. The build itself runs with code-style
+          enforcement off, so this is the fast replacement; the full analysis belongs to the caller's nightly.
+        type: boolean
+        required: false
+        default: true
+      incremental:
+        description: >-
+          Restore the compiled output (obj/) that the repository's dev push saved, normalise file
+          times against it, and build with the flags that keep the commit id out of the compiler.
+          Needs a producer that saves the cache (see the caller's dev-compile). Off = v1 behaviour.
+        type: boolean
+        required: false
+        default: false
+      selector:
+        description: >-
+          Path, relative to the repository root, of a script that prints the tests this change needs
+          (see omni237 .github/ci/select-affected.py). It is read from HEAD^1 (the base), so a pull
+          request cannot edit its own selector. Empty, absent at the base, or failing: run everything.
+        type: string
+        required: false
+        default: ""
+      cache-dependency-path:
+        description: Files whose hash keys the NuGet cache (one glob per line).
+        type: string
+        required: false
+        default: |
+          **/packages.lock.json
+          **/Directory.*.props
+          **/*.csproj
+          global.json
+      job-private-nuget:
+        description: >-
+          Use job-private NuGet folders: write NUGET_PACKAGES=$RUNNER_TEMP/nuget-packages and
+          NUGET_HTTP_CACHE_PATH=$RUNNER_TEMP/nuget-http-cache to GITHUB_ENV first, fail unless both are folders
+          under $RUNNER_TEMP, and restore the NuGet cache into $RUNNER_TEMP/nuget-packages instead of
+          ~/.nuget/packages. Set it when the caller's producer workflow (the one that saves the compiled output the
+          lane restores) builds against $RUNNER_TEMP/nuget-packages: the cached obj/ is reusable only when the
+          packages folder has the same path. Default false: the lane keeps ~/.nuget/packages, as before.
+        type: boolean
+        required: false
+        default: false
+      global-json-sdk:
+        description: >-
+          With `incremental`: install exactly the SDK version global.json names (setup-dotnet, into
+          $RUNNER_TEMP/dotnet, so it is the only SDK the job can resolve) instead of using the runner image's, and
+          fail the job unless `dotnet --version` is that version. Set it when the caller's producer workflow builds
+          the cached obj/ with the same install: the cache is keyed by the SDK version and is reusable only when
+          producer and lane used the same SDK at the same path. Default false: the image's SDK, as before.
+        type: boolean
+        required: false
+        default: false
+      static-checks-background:
+        description: >-
+          Start `static-checks` in the background and join it in the `Static checks (result)` step, just before the
+          restore, so the checks overlap the NuGet cache download. The job still fails when they fail, never
+          start, or end without a result. Default false: the checks run to completion first, as before.
+        type: boolean
+        required: false
+        default: false
+      shards-test:
+        description: >-
+          Shell command, run from the repository root in the `plan` job, that prints on stdout a JSON array
+          [{"label": string, "project": string, "filter": string}] of test shards. They run, in parallel with the
+          lane, on a pull request into test or main. Empty means none, and then the verdict fails on those pull
+          requests (a gate that owes shards and has none is not a pass).
+        type: string
+        required: false
+        default: ""
+      shards-uat:
+        description: The same as `shards-test`, for a pull request into uat (the whole suite).
+        type: string
+        required: false
+        default: ""
+      shard-timeout-minutes:
+        description: Safety timeout of each shard job.
+        type: number
+        required: false
+        default: 45
+      hang-timeout:
+        description: Per-test hang timeout of the shards (`--blame-hang`, a dotnet duration such as 20m).
+        type: string
+        required: false
+        default: 20m
+      timeout-minutes:
+        description: Timeout of the lane job.
+        type: number
+        required: false
+        default: 15
+      runner:
+        description: Runner label.
+        type: string
+        required: false
+        default: ubuntu-24.04
+    secrets:
+      GH_PACKAGES_TOKEN:
+        description: Read-only token for the private package feed (read:packages).
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    name: lane
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      # dev | test | uat, from the branch the pull request targets (main counts as test; any other base counts as dev).
+      GATE: ${{ github.event_name == 'pull_request' && (github.base_ref == 'uat' && 'uat' || ((github.base_ref == 'test' || github.base_ref == 'main') && 'test' || 'dev')) || 'dev' }}
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      MSBUILDDISABLENODEREUSE: "1"
+    steps:
+      # FIRST, before checkout, the static checks or any .NET step (see JOB-PRIVATE NUGET FOLDERS above).
+      - name: Use job-owned NuGet locations
+        if: inputs.job-private-nuget
+        run: |
+          printf 'NUGET_PACKAGES=%s/nuget-packages\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'NUGET_HTTP_CACHE_PATH=%s/nuget-http-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Fail unless the NuGet locations are job-owned
+        if: inputs.job-private-nuget
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "FAIL RUNNER_TEMP is unset or empty" >&2
+            exit 1
+          fi
+          for name in NUGET_PACKAGES NUGET_HTTP_CACHE_PATH; do
+            value="${!name:-}"
+            echo "$name=${value:-<unset>}"
+            case "$value" in
+              *..*) echo "FAIL $name contains '..'" >&2; exit 1 ;;
+              "$RUNNER_TEMP"/?*) ;;
+              *) echo "FAIL $name is '${value:-<unset>}', not a folder under RUNNER_TEMP ($RUNNER_TEMP): this job would read the runner account's NuGet state" >&2; exit 1 ;;
+            esac
+          done
+
+      - name: Checkout (the pull request merged into its base)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Docs-only change
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          # Only the dev gate may skip as docs-only: a promotion or a uat pull request runs everything it has.
+          IGNORE_REGEX: ${{ env.GATE == 'dev' && inputs.docs-only-regex || '' }}
+        run: |
+          set -euo pipefail
+          skip=false
+          # On a pull_request the checkout is the merge commit: HEAD^1 is the base tip and
+          # HEAD^2 the pull request head, so this diff is exactly what the pull request changes.
+          if [ "$EVENT" = "pull_request" ] && [ -n "$IGNORE_REGEX" ] && git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            files="$(git diff --name-only 'HEAD^1' HEAD)"
+            # grep -Ev prints the files that do NOT match and reads ALL of its input; its exit status says what is
+            # left: 1 = nothing left (every file is ignorable), 0 = some file is not, 2 or more = grep failed, which is
+            # NOT "docs only". Never `grep -q` here: it stops at the first hit, printf then dies on the closed pipe once
+            # the list passes the 64 KB pipe buffer (about 1,000 files), pipefail turns that into a failed pipeline, and a
+            # promotion of 1,411 files was classified docs-only and skipped every test (omni237#5473, ThruuAi/.github#11).
+            if [ -n "$files" ]; then
+              rc=0
+              # Captured, not sent to /dev/null: GNU grep stops at the first match when its output is /dev/null.
+              # shellcheck disable=SC2034  # captured only so that grep reads all of its input
+              others="$(printf '%s\n' "$files" | grep -Ev -- "$IGNORE_REGEX")" || rc=$?
+              if [ "$rc" -eq 1 ]; then
+                skip=true
+                echo "Every changed file matches the docs-only pattern; nothing to build."
+              fi
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      # `global-json-sdk` (first, BEFORE the static checks start, so the download has the runner to itself: with the
+      # background checks running beside it the same install took 24 s instead of 12): the SDK global.json names, installed on its own under $RUNNER_TEMP/dotnet (setup-dotnet
+      # adds it to PATH and sets DOTNET_ROOT, and the `dotnet` host only sees the SDKs beside it, so this is the one
+      # SDK every later step resolves). The path is the same on every runner, like the NuGet folder above.
+      - name: Pinned .NET SDK (the version global.json names, same install path on every runner)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental && inputs.global-json-sdk
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          global-json-file: global.json
+
+      # Without `global-json-sdk` the runner image carries the SDK (global.json says latestPatch of 10.0.101 and the
+      # image ships a newer 10.0.x; a roll of the image changes the patch). Fail closed if the image has none. With it,
+      # the version must be exactly the one global.json names.
+      - name: .NET SDK from the image (must satisfy global.json)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        id: sdk
+        env:
+          PINNED: ${{ inputs.global-json-sdk }}
+        run: |
+          set -euo pipefail
+          v="$(dotnet --version)"      # resolves global.json; fails when no installed SDK satisfies it
+          if [ "$PINNED" = "true" ]; then
+            want="$(python3 -c 'import json; print(json.load(open("global.json"))["sdk"]["version"])')"
+            if [ "$v" != "$want" ]; then
+              echo "FAIL global-json-sdk: dotnet resolves $v but global.json names $want" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "SDK $v"
+
+      # Runs on docs-only changes too: the secret scan must see a token pasted into a .md file
+      # (review pr-lane-v2-r1 note 2). It costs seconds.
+      - name: Static checks
+        if: inputs.static-checks != ''
+        env:
+          CHECKS: ${{ inputs.static-checks }}
+          BACKGROUND: ${{ inputs.static-checks-background }}
+        run: |
+          if [ "$BACKGROUND" != "true" ]; then
+            bash -euo pipefail -c "$CHECKS"
+            exit
+          fi
+          # In the background (see `static-checks-background`): detached, every stream on a file, so this step ends
+          # at once and the runner does not wait for it. The wrapper records its own pid first, and writes the exit
+          # status to `rc` only when the script is done (rename, so `rc` is never half-written). `nice`: the checks use
+          # the cores the NuGet download and extraction leave free instead of slowing them.
+          set -euo pipefail
+          dir="$RUNNER_TEMP/static-checks-bg"
+          rm -rf "$dir"; mkdir -p "$dir"
+          printf '%s\n' "$CHECKS" > "$dir/checks.sh"
+          # `setsid` (util-linux, on every hosted runner) puts it in a session of its own; where it is missing (a
+          # Mac running these tests) the plain background job is used.
+          detach=(); if command -v setsid > /dev/null; then detach=(setsid); fi
+          "${detach[@]}" nice -n 10 nohup bash -c 'echo $$ > "$1/pid"; bash -euo pipefail "$1/checks.sh" > "$1/log" 2>&1; echo $? > "$1/rc.tmp"; mv "$1/rc.tmp" "$1/rc"' _ "$dir" > /dev/null 2>&1 < /dev/null &
+          echo "static checks started in the background; the result is joined before the restore"
+
+      # What does this change need? Runs the BASE's copy of the selector. Any problem: everything.
+      - name: Select tests
+        id: select
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          SELECTOR: ${{ inputs.selector }}
+          IGNORE_REGEX: ${{ inputs.docs-only-regex }}
+        run: |
+          set -uo pipefail
+          all() { { echo "scope=all"; echo "unit_mode=all"; echo "unit_filter="; echo "rls=true"; } >> "$GITHUB_OUTPUT"; echo "selection: $1; running everything"; }
+          if [ "$GATE" != dev ]; then all "the $GATE gate runs everything"; exit 0; fi
+          if [ -z "$SELECTOR" ]; then all "no selector configured"; exit 0; fi
+          if ! git rev-parse -q --verify 'HEAD^2' >/dev/null; then all "not a merge checkout"; exit 0; fi
+          if ! git cat-file -e "HEAD^1:$SELECTOR" 2>/dev/null; then all "selector not present at the base"; exit 0; fi
+          git show "HEAD^1:$SELECTOR" > "$RUNNER_TEMP/pr-lane-selector.py"   # never name it select.py: it would shadow the stdlib module subprocess imports
+          out="$RUNNER_TEMP/select.out"; : > "$out"
+          if timeout 120 python3 -I "$RUNNER_TEMP/pr-lane-selector.py" --base HEAD^1 --head HEAD --docs-only-regex "$IGNORE_REGEX" --github-output "$out" > "$RUNNER_TEMP/select.json"; then
+            cat "$RUNNER_TEMP/select.json"
+            if grep -q '"reason": "selector error' "$RUNNER_TEMP/select.json"; then
+              echo "::warning::the selector failed and fell back to running everything (see the log above)"
+            fi
+            # multi-line safe: the selector writes single-line key=value pairs
+            grep -E '^(scope|unit_mode|unit_filter|rls)=' "$out" >> "$GITHUB_OUTPUT" || all "selector wrote no outputs"
+          else
+            all "selector failed"
+          fi
+
+      - name: Setup .NET (SDK from global.json, NuGet cache)
+        if: steps.scope.outputs.skip != 'true' && !inputs.incremental
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: NuGet packages (restore from the dev cache)
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          # The folder the compiled-output cache below was built against (see JOB-PRIVATE NUGET FOLDERS).
+          path: ${{ inputs.job-private-nuget && format('{0}/nuget-packages', runner.temp) || '~/.nuget/packages' }}
+          key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # Compiled output of the dev tip (saved by the repository's dev push, never by a pull request:
+      # a cache written under a PR ref is invisible to every other PR). Prefix match picks the newest.
+      - name: Compiled output (restore obj/ from dev)
+        id: obj
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            src/**/obj
+            .ci-cache
+          key: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}
+          restore-keys: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-
+
+      # Fail closed. The BASE's copy runs (the head must not choose how its own times are normalised).
+      # A missing copy at the base (the first adoption) or a missing cache leaves every file stamped
+      # "now", which rebuilds everything: slow, never wrong. A script that FAILS is a red job: it stamps
+      # old before it stamps new, and a half-done run would hide a changed file behind a stale output.
+      - name: Normalise file times against the cached tree
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        run: |
+          set -euo pipefail
+          if [ ! -s .ci-cache/tree-manifest.txt ]; then
+            echo "::warning::no compiled-output cache from the base branch; this is a cold build"
+            exit 0
+          fi
+          if ! git cat-file -e 'HEAD^1:.github/ci/normalise-mtimes.sh' 2>/dev/null; then
+            echo "::warning::normalise-mtimes.sh is not present at the base; this is a cold build"
+            exit 0
+          fi
+          git show 'HEAD^1:.github/ci/normalise-mtimes.sh' > "$RUNNER_TEMP/normalise-mtimes.sh"
+          bash "$RUNNER_TEMP/normalise-mtimes.sh" .ci-cache/tree-manifest.txt
+
+      # The join of `static-checks-background`: it runs on every pull request (docs-only ones included, where
+      # nothing else ran), BEFORE the restore and the build, so a failed check still stops the job before the
+      # expensive steps. `!cancelled()`: it also reports when an earlier step failed, so the log is never lost.
+      # Fail closed: no start record, a process that is gone without a result, or no result within 10 minutes
+      # (the longest check takes under a minute) is a failure, never a pass.
+      - name: Static checks (result)
+        if: ${{ !cancelled() && inputs.static-checks != '' && inputs.static-checks-background }}
+        run: |
+          set -uo pipefail
+          dir="$RUNNER_TEMP/static-checks-bg"
+          deadline=$((SECONDS + 600))
+          for _ in $(seq 1 30); do [ -s "$dir/pid" ] && break; sleep 0.1; done   # the wrapper writes its pid first thing
+          while [ ! -f "$dir/rc" ]; do
+            if [ ! -s "$dir/pid" ]; then echo "FAIL the static checks were never started" >&2; exit 1; fi
+            if ! kill -0 "$(cat "$dir/pid")" 2>/dev/null; then
+              sleep 1
+              [ -f "$dir/rc" ] && break
+              echo "FAIL the static checks process is gone without a result" >&2
+              cat "$dir/log" 2>/dev/null || true
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "FAIL the static checks gave no result in 10 minutes" >&2
+              cat "$dir/log" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 1
+          done
+          cat "$dir/log"
+          rc="$(cat "$dir/rc")"
+          if [ "$rc" != "0" ]; then
+            echo "::error::the static checks failed (exit status $rc)"
+            exit 1
+          fi
+          echo "the static checks passed"
+
+      # The ONLY step that sees the package token. Build and tests below run without it.
+      # Incremental mode restores and builds the unit projects, plus the integration projects only when the selector
+      # says the RLS slice runs. The rest of the solution (E2E, AppHost) is compiled by the repository's producer
+      # workflow on the base branch after the merge.
+      - name: Restore
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          UNIT_PROJECTS: ${{ inputs.unit-projects }}
+          INTEGRATION_PROJECTS: ${{ inputs.integration-projects }}
+          RLS: ${{ steps.select.outputs.rls }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          words() { printf '%s\n' "$1" | tr -s ' \t' '\n' | sed '/^$/d'; }
+          if [ "$INCREMENTAL" = "true" ]; then
+            # the same predicate as the test step: anything but an explicit `false` builds what the slice needs
+            if [ "$RLS" = "false" ]; then INTEGRATION_PROJECTS=""; fi
+            mapfile -t targets < <(words "$UNIT_PROJECTS"$'\n'"$INTEGRATION_PROJECTS")
+          else
+            targets=("$SOLUTION")
+          fi
+          for t in "${targets[@]}"; do dotnet restore "$t" --nologo -v q "${extra[@]}"; done
+
+      # Warnings are errors where the repository's own Directory.Build.props says so: compiler warnings
+      # still fail the build. Only the IDE code-style rules are off here (EnforceCodeStyleInBuild
+      # costs about 1.5 minutes on a cold 2-core runner); the next step checks them on the changed
+      # files, and the caller's nightly builds with them on.
+      - name: Build (Release)
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          UNIT_PROJECTS: ${{ inputs.unit-projects }}
+          INTEGRATION_PROJECTS: ${{ inputs.integration-projects }}
+          RLS: ${{ steps.select.outputs.rls }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          words() { printf '%s\n' "$1" | tr -s ' \t' '\n' | sed '/^$/d'; }
+          flags=()
+          targets=("$SOLUTION")
+          if [ "$INCREMENTAL" = "true" ]; then
+            # Keep the commit id out of every compiler input (otherwise every push recompiles all
+            # projects: measured 18 Csc calls for a one-line change), and hard-link copy-local files
+            # (bin/ is not cached, so ~600 MB per test project would otherwise be copied).
+            flags=(-m:2 -p:IncludeSourceRevisionInInformationalVersion=false -p:EnableSourceLink=false
+                   -p:EmbedUntrackedSources=false -p:CreateHardLinksForCopyLocalIfPossible=true)
+            # the same predicate as the test step: anything but an explicit `false` builds what the slice needs
+            if [ "$RLS" = "false" ]; then INTEGRATION_PROJECTS=""; fi
+            mapfile -t targets < <(words "$UNIT_PROJECTS"$'\n'"$INTEGRATION_PROJECTS")
+          fi
+          for t in "${targets[@]}"; do
+            dotnet build "$t" -c Release --no-restore --nologo -v q -p:EnforceCodeStyleInBuild=false "${flags[@]}" "${extra[@]}"
+          done
+
+      # Style and whitespace on the changed files only, against the base (HEAD^1 of the merge commit).
+      # Deleted files are excluded; a pull request with no .cs change skips the step.
+      - name: Code style (changed files)
+        if: steps.scope.outputs.skip != 'true' && inputs.format-verify && github.event_name == 'pull_request' && env.GATE == 'dev'
+        timeout-minutes: 4
+        env:
+          SOLUTION: ${{ inputs.solution }}
+          INCREMENTAL: ${{ inputs.incremental }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR 'HEAD^1' HEAD -- '*.cs')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No .cs file changed; nothing to check."
+            exit 0
+          fi
+          echo "Checking ${#files[@]} changed .cs file(s)."
+          # `dotnet format style` loads the whole solution (about 90 s on a 2-core runner) and, with no
+          # .editorconfig/.globalconfig in the repository, has nothing to enforce (measured: unused usings, `this.`,
+          # var-vs-explicit all pass it). Whitespace in folder mode is about 1 s and loads no project.
+          if [ "$INCREMENTAL" = "true" ]; then
+            dotnet format whitespace --folder . --verify-no-changes --verbosity minimal --include "${files[@]}"
+          else
+            dotnet format whitespace "$SOLUTION" --verify-no-changes --no-restore --verbosity minimal --include "${files[@]}"
+            dotnet format style "$SOLUTION" --verify-no-changes --no-restore --verbosity minimal --include "${files[@]}"
+          fi
+
+      # v1 (incremental: false): unit tests, then the filtered integration tests, in sequence.
+      # v2 (incremental: true): the RLS slice (it waits on a Postgres container, so it does not compete
+      # for the two cores) starts first and runs while the unit tests run.
+      - name: Tests (unit, then RLS slice)
+        if: steps.scope.outputs.skip != 'true' && (steps.select.outputs.unit_mode != 'none' || (inputs.incremental && steps.select.outputs.rls != 'false' && inputs.integration-filter != ''))
+        env:
+          PROJECTS: ${{ inputs.unit-projects }}
+          UNIT_MODE: ${{ steps.select.outputs.unit_mode }}
+          UNIT_FILTER: ${{ steps.select.outputs.unit_filter }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          RLS: ${{ steps.select.outputs.rls }}
+          INT_PROJECTS: ${{ inputs.integration-projects }}
+          INT_FILTER: ${{ inputs.integration-filter }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/trx"
+          rc=0
+          rls_pid=""
+          if [ "$INCREMENTAL" = "true" ] && [ "$RLS" != "false" ] && [ -n "$INT_FILTER" ] && [ -n "$INT_PROJECTS" ]; then
+            ( for p in $INT_PROJECTS; do
+                name="$(basename "$p" .csproj)"
+                dotnet test "$p" --no-build --no-restore -c Release --nologo --filter "$INT_FILTER" \
+                  --logger "trx;LogFileName=$name.trx" --results-directory "$RUNNER_TEMP/trx/$name" || exit 1
+              done ) > "$RUNNER_TEMP/rls.log" 2>&1 &
+            rls_pid=$!
+          fi
+          if [ "$UNIT_MODE" != "none" ]; then
+            args=()
+            if [ "$UNIT_MODE" = "filter" ]; then
+              [ -n "$UNIT_FILTER" ] || { echo "selector said filter but gave none; refusing"; exit 1; }
+              args=(--filter "$UNIT_FILTER")
+            fi
+            for p in $PROJECTS; do
+              name="$(basename "$p" .csproj)"
+              echo "::group::dotnet test $name (${UNIT_MODE:-all})"
+              dotnet test "$p" --no-build --no-restore -c Release --nologo "${args[@]}" \
+                --logger "trx;LogFileName=$name.trx" --results-directory "$RUNNER_TEMP/trx/$name" || rc=1
+              echo "::endgroup::"
+            done
+          fi
+          if [ -n "$rls_pid" ]; then
+            wait "$rls_pid" || rc=1
+            echo "::group::RLS slice (ran alongside the unit tests)"; cat "$RUNNER_TEMP/rls.log"; echo "::endgroup::"
+          fi
+          exit "$rc"
+
+      - name: Integration tests (filtered)
+        if: steps.scope.outputs.skip != 'true' && !inputs.incremental && inputs.integration-filter != '' && inputs.integration-projects != ''
+        env:
+          PROJECTS: ${{ inputs.integration-projects }}
+          FILTER: ${{ inputs.integration-filter }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trx"
+          rc=0
+          for p in $PROJECTS; do
+            name="$(basename "$p" .csproj)"
+            echo "::group::dotnet test $name (filtered)"
+            dotnet test "$p" --no-build --no-restore -c Release --nologo --filter "$FILTER" \
+              --logger "trx;LogFileName=$name.trx" --results-directory "$RUNNER_TEMP/trx/$name" || rc=1
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
+      - name: Upload test results (failure only)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trx-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/trx/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The matrix of the test and uat gates, printed by the caller's own command. It runs the head's script on the merge
+  # checkout: that is the same trust as running the head's tests (a pull request can edit those too; the reviewer of a
+  # `.github/**` or `infra/ci/**` change reads it), and it never sees the package token.
+  plan:
+    name: plan
+    if: ${{ github.event_name == 'pull_request' && (github.base_ref == 'test' || github.base_ref == 'main' || github.base_ref == 'uat') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - name: Checkout (the pull request merged into its base)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Shard matrix
+        id: plan
+        env:
+          BASE: ${{ github.base_ref }}
+          COMMAND_TEST: ${{ inputs.shards-test }}
+          COMMAND_UAT: ${{ inputs.shards-uat }}
+        run: |
+          set -euo pipefail
+          command="$COMMAND_TEST"; [ "$BASE" = uat ] && command="$COMMAND_UAT"
+          if [ -z "$command" ]; then
+            echo "::error::the $BASE gate owes test shards and the caller gave no command (shards-test / shards-uat)"
+            exit 1
+          fi
+          bash -euo pipefail -c "$command" > "$RUNNER_TEMP/matrix.json"
+          # An array of {label, project, filter}, at least one, labels unique: anything else is a broken plan, not a pass.
+          python3 - "$RUNNER_TEMP/matrix.json" <<'PY'
+          import json, sys
+          matrix = json.load(open(sys.argv[1]))
+          assert isinstance(matrix, list) and matrix, "the plan is empty"
+          labels = [m["label"] for m in matrix]
+          assert len(set(labels)) == len(labels), "duplicate shard labels"
+          for m in matrix:
+              assert set(m) == {"label", "project", "filter"} and all(isinstance(v, str) for v in m.values()), f"bad shard {m!r}"
+              assert m["label"] and m["project"], f"bad shard {m!r}"
+          print(f"{len(matrix)} shard(s): " + ", ".join(labels))
+          PY
+          echo "matrix=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$RUNNER_TEMP/matrix.json")" >> "$GITHUB_OUTPUT"
+          echo "count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$RUNNER_TEMP/matrix.json")" >> "$GITHUB_OUTPUT"
+
+  # The test shards of the test and uat gates: one job per matrix entry, each restoring the lane's caches, building only
+  # its test project and running its filter.
+  shard:
+    name: ${{ matrix.shard.label }}
+    needs: plan
+    if: ${{ needs.plan.result == 'success' }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.shard-timeout-minutes }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The placeholder only keeps the expression valid when the plan was skipped (the dev gate); `if` then skips the job.
+        shard: ${{ fromJSON(needs.plan.outputs.matrix || '[{"label":"none","project":"","filter":""}]') }}
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      MSBUILDDISABLENODEREUSE: "1"
+    steps:
+      # FIRST, before checkout, the static checks or any .NET step (see JOB-PRIVATE NUGET FOLDERS above).
+      - name: Use job-owned NuGet locations
+        if: inputs.job-private-nuget
+        run: |
+          printf 'NUGET_PACKAGES=%s/nuget-packages\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'NUGET_HTTP_CACHE_PATH=%s/nuget-http-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Fail unless the NuGet locations are job-owned
+        if: inputs.job-private-nuget
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "FAIL RUNNER_TEMP is unset or empty" >&2
+            exit 1
+          fi
+          for name in NUGET_PACKAGES NUGET_HTTP_CACHE_PATH; do
+            value="${!name:-}"
+            echo "$name=${value:-<unset>}"
+            case "$value" in
+              *..*) echo "FAIL $name contains '..'" >&2; exit 1 ;;
+              "$RUNNER_TEMP"/?*) ;;
+              *) echo "FAIL $name is '${value:-<unset>}', not a folder under RUNNER_TEMP ($RUNNER_TEMP): this job would read the runner account's NuGet state" >&2; exit 1 ;;
+            esac
+          done
+
+      - name: Checkout (the pull request merged into its base)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      # `global-json-sdk` (first, BEFORE the static checks start, so the download has the runner to itself: with the
+      # background checks running beside it the same install took 24 s instead of 12): the SDK global.json names, installed on its own under $RUNNER_TEMP/dotnet (setup-dotnet
+      # adds it to PATH and sets DOTNET_ROOT, and the `dotnet` host only sees the SDKs beside it, so this is the one
+      # SDK every later step resolves). The path is the same on every runner, like the NuGet folder above.
+      - name: Pinned .NET SDK (the version global.json names, same install path on every runner)
+        if: inputs.incremental && inputs.global-json-sdk
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          global-json-file: global.json
+
+      # Without `global-json-sdk` the runner image carries the SDK (global.json says latestPatch of 10.0.101 and the
+      # image ships a newer 10.0.x; a roll of the image changes the patch). Fail closed if the image has none. With it,
+      # the version must be exactly the one global.json names.
+      - name: .NET SDK from the image (must satisfy global.json)
+        if: inputs.incremental
+        id: sdk
+        env:
+          PINNED: ${{ inputs.global-json-sdk }}
+        run: |
+          set -euo pipefail
+          v="$(dotnet --version)"      # resolves global.json; fails when no installed SDK satisfies it
+          if [ "$PINNED" = "true" ]; then
+            want="$(python3 -c 'import json; print(json.load(open("global.json"))["sdk"]["version"])')"
+            if [ "$v" != "$want" ]; then
+              echo "FAIL global-json-sdk: dotnet resolves $v but global.json names $want" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "SDK $v"
+
+      - name: Setup .NET (SDK from global.json, NuGet cache)
+        if: ${{ !inputs.incremental }}
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: NuGet packages (restore from the dev cache)
+        if: inputs.incremental
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          # The folder the compiled-output cache below was built against (see JOB-PRIVATE NUGET FOLDERS).
+          path: ${{ inputs.job-private-nuget && format('{0}/nuget-packages', runner.temp) || '~/.nuget/packages' }}
+          key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # Compiled output of the dev tip (saved by the repository's dev push, never by a pull request:
+      # a cache written under a PR ref is invisible to every other PR). Prefix match picks the newest.
+      - name: Compiled output (restore obj/ from dev)
+        id: obj
+        if: inputs.incremental
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            src/**/obj
+            .ci-cache
+          key: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}
+          restore-keys: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-
+
+      # Fail closed. The BASE's copy runs (the head must not choose how its own times are normalised).
+      # A missing copy at the base (the first adoption) or a missing cache leaves every file stamped
+      # "now", which rebuilds everything: slow, never wrong. A script that FAILS is a red job: it stamps
+      # old before it stamps new, and a half-done run would hide a changed file behind a stale output.
+      - name: Normalise file times against the cached tree
+        if: inputs.incremental
+        run: |
+          set -euo pipefail
+          if [ ! -s .ci-cache/tree-manifest.txt ]; then
+            echo "::warning::no compiled-output cache from the base branch; this is a cold build"
+            exit 0
+          fi
+          if ! git cat-file -e 'HEAD^1:.github/ci/normalise-mtimes.sh' 2>/dev/null; then
+            echo "::warning::normalise-mtimes.sh is not present at the base; this is a cold build"
+            exit 0
+          fi
+          git show 'HEAD^1:.github/ci/normalise-mtimes.sh' > "$RUNNER_TEMP/normalise-mtimes.sh"
+          bash "$RUNNER_TEMP/normalise-mtimes.sh" .ci-cache/tree-manifest.txt
+
+      # The ONLY step that sees the package token. Only the shard's own test project is restored and built.
+      - name: Restore
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          PROJECT: ${{ matrix.shard.project }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          target="$SOLUTION"; [ "$INCREMENTAL" = "true" ] && target="$PROJECT"
+          dotnet restore "$target" --nologo -v q "${extra[@]}"
+
+      # The same flags as the lane's build, so the restored compiled output is reused the same way.
+      - name: Build (Release)
+        env:
+          SOLUTION: ${{ inputs.solution }}
+          MSBUILD_ARGS: ${{ inputs.msbuild-args }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          PROJECT: ${{ matrix.shard.project }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$MSBUILD_ARGS"
+          flags=(); target="$SOLUTION"
+          if [ "$INCREMENTAL" = "true" ]; then
+            flags=(-m:2 -p:IncludeSourceRevisionInInformationalVersion=false -p:EnableSourceLink=false
+                   -p:EmbedUntrackedSources=false -p:CreateHardLinksForCopyLocalIfPossible=true)
+            target="$PROJECT"
+          fi
+          dotnet build "$target" -c Release --no-restore --nologo -v q -p:EnforceCodeStyleInBuild=false "${flags[@]}" "${extra[@]}"
+
+      # A filter that selects nothing must not pass: the TRX has to report at least one test.
+      - name: Test (${{ matrix.shard.label }})
+        id: test
+        env:
+          LABEL: ${{ matrix.shard.label }}
+          PROJECT: ${{ matrix.shard.project }}
+          FILTER: ${{ matrix.shard.filter }}
+          HANG: ${{ inputs.hang-timeout }}
+        run: |
+          set -euo pipefail
+          safe="${LABEL//[^A-Za-z0-9._-]/_}"
+          echo "safe=$safe" >> "$GITHUB_OUTPUT"
+          out="$RUNNER_TEMP/trx"
+          mkdir -p "$out"
+          args=()
+          [ -n "$FILTER" ] && args+=(--filter "$FILTER")
+          dotnet test "$PROJECT" --no-build --no-restore -c Release --nologo "${args[@]}" \
+            --blame-hang --blame-hang-timeout "$HANG" --blame-hang-dump-type mini \
+            --logger "trx;LogFileName=$safe.trx" --logger "console;verbosity=normal" \
+            --results-directory "$out"
+          total="$(grep -o '<Counters total="[0-9]*"' "$out/$safe.trx" | head -n1 | grep -o '[0-9]*' || echo 0)"
+          echo "Shard $LABEL ran $total test(s)."
+          if [ "${total:-0}" -eq 0 ]; then
+            echo "::error::Shard $LABEL selected no tests (project $PROJECT, filter '$FILTER')."
+            exit 1
+          fi
+
+      - name: Upload test results (failure only)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trx-${{ steps.test.outputs.safe || 'shard' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/trx/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # THE CHECK a ruleset requires (`<caller job> / ci`). It runs always: a required check that is skipped counts as passed.
+  ci:
+    name: ci
+    needs: [lane, plan, shard]
+    if: ${{ always() }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Verdict (the lane, and on a test, main or uat pull request the plan and every shard)
+        env:
+          GATE: ${{ github.event_name == 'pull_request' && (github.base_ref == 'uat' && 'uat' || ((github.base_ref == 'test' || github.base_ref == 'main') && 'test' || 'dev')) || 'dev' }}
+          LANE: ${{ needs.lane.result }}
+          PLAN: ${{ needs.plan.result }}
+          SHARD: ${{ needs.shard.result }}
+          COUNT: ${{ needs.plan.outputs.count }}
+        run: |
+          set -uo pipefail
+          echo "gate=$GATE lane=$LANE plan=$PLAN shards=$SHARD count=${COUNT:-none}"
+          bad=0
+          problem() { echo "::error::$1"; bad=1; }
+          [ "$LANE" = success ] || problem "the lane did not succeed ($LANE)"
+          if [ "$GATE" = dev ]; then
+            # The dev gate is the lane alone: a plan or a shard that ran there is a workflow defect, not a pass.
+            [ "$PLAN" = skipped ] && [ "$SHARD" = skipped ] || problem "the dev gate ran a plan or shards (plan=$PLAN shards=$SHARD)"
+          else
+            [ "$PLAN" = success ] || problem "the $GATE gate owes a shard plan and it did not succeed ($PLAN)"
+            case "${COUNT:-}" in ''|*[!0-9]*|0) problem "the $GATE gate has no shards (count='${COUNT:-}')" ;; esac
+            [ "$SHARD" = success ] || problem "not every test shard succeeded ($SHARD)"
+          fi
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+          echo "pass: gate $GATE, lane green${COUNT:+, $COUNT shard(s) green}"

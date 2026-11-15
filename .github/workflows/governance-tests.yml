@@ -67,6 +67,10 @@ jobs:
         run: python3 governance/tests/docs-only-classification.test.py
       - name: PR lane docs-only classification, mutation proof
         run: python3 governance/tests/docs-only-classification.mutations.py
+      - name: PR gate v3 (lane, plan, test shards and the verdict)
+        run: python3 governance/tests/pr-gate-v3.test.py
+      - name: PR gate v3, mutation proof
+        run: python3 governance/tests/pr-gate-v3.mutations.py
       - name: shellcheck
         run: shellcheck governance/bootstrap.sh governance/identity/*.sh
       - name: identity manifests parse
