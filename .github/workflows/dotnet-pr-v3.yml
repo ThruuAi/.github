@@ -384,6 +384,8 @@ jobs:
       # old before it stamps new, and a half-done run would hide a changed file behind a stale output.
       - name: Normalise file times against the cached tree
         if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        env:
+          PINNED: ${{ inputs.global-json-sdk }}
         run: |
           set -euo pipefail
           if [ ! -s .ci-cache/tree-manifest.txt ]; then
@@ -396,6 +398,16 @@ jobs:
           fi
           git show 'HEAD^1:.github/ci/normalise-mtimes.sh' > "$RUNNER_TEMP/normalise-mtimes.sh"
           bash "$RUNNER_TEMP/normalise-mtimes.sh" .ci-cache/tree-manifest.txt
+          # The SDK `global-json-sdk` installed a minute ago is stamped "now", so its Microsoft.Common.targets (an
+          # input of every project's generated AssemblyAttributes.cs, and so of CoreCompile) is newer than every
+          # restored output: measured on a docs-only change, all 18 projects recompiled (18 Csc calls, 224 s) with
+          # "Input file .../sdk/10.0.101/Microsoft.Common.targets is newer than output file". The cache key carries
+          # the SDK version, so the cached output was built by this same SDK: stamp the install old, like the tree.
+          # Only the install this job made itself, under $RUNNER_TEMP (never the runner image's SDK).
+          if [ "$PINNED" = "true" ] && [ -n "${DOTNET_ROOT:-}" ] && [ "${DOTNET_ROOT#"$RUNNER_TEMP"/}" != "$DOTNET_ROOT" ] && [ -d "$DOTNET_ROOT" ]; then
+            find "$DOTNET_ROOT" -type f -print0 | xargs -0 touch -h -t 200001010000
+            echo "the pinned SDK under $DOTNET_ROOT is stamped old, like the cached tree"
+          fi
 
       # The join of `static-checks-background`: it runs on every pull request (docs-only ones included, where
       # nothing else ran), BEFORE the restore and the build, so a failed check still stops the job before the
