@@ -16,7 +16,10 @@ What is pinned:
     red plan, never an empty gate;
   * a shard's test step is RUN with a fake `dotnet`: a filter that selects no test fails the shard;
   * the lane runs everything (no selector, no docs-only skip, no code-style step) off the dev gate;
-  * the GATE expression, which three places repeat, is the same text everywhere and maps the branches as documented.
+  * the GATE expression, which three places repeat, is the same text everywhere and maps the branches as documented;
+  * the lane's `Normalise file times` step is RUN over a scratch repository: the SDK that `global-json-sdk` installed
+    under $RUNNER_TEMP is stamped old (its targets must not look newer than the cached output, or every project
+    recompiles); an SDK outside $RUNNER_TEMP, an unpinned run and a cold build (no manifest) touch nothing.
 
     python3 governance/tests/pr-gate-v3.test.py
 
@@ -289,6 +292,83 @@ mkdir -p "$out"; printf '<TestRun><ResultSummary><Counters total="{total}" execu
     def test_the_label_becomes_a_safe_file_name(self):
         done = self.run_test(3, label='E2E / 1 (a b)')
         self.assertEqual(done.returncode, 1, 'the fake writes Shard_1.trx, so a different safe name finds no TRX and fails')
+
+
+NORMALISE = 'Normalise file times against the cached tree'
+OLD = 950000000   # 2000-01-01 is 946684800; a file stamped "now" is far above this
+
+
+class SdkTimes(Scratch):
+    """The lane's normalise step, run over a scratch repository with a fake SDK install."""
+
+    def setUp(self):
+        super().setUp()
+        env = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
+
+        def git(*args):
+            subprocess.run(['git', *args], cwd=self.work, env=env, check=True, capture_output=True)
+        git('init', '-q')
+        os.makedirs(os.path.join(self.work, '.github', 'ci'))
+        with open(os.path.join(self.work, '.github', 'ci', 'normalise-mtimes.sh'), 'w') as handle:
+            handle.write('exit 0\n')   # the repository's own script is not under test here
+        git('add', '-A')
+        git('commit', '-q', '-m', 'base')
+        with open(os.path.join(self.work, 'x.txt'), 'w') as handle:
+            handle.write('x\n')
+        git('add', '-A')
+        git('commit', '-q', '-m', 'head')
+        self.sdk = os.path.join(self.temp, 'dotnet')
+        self.targets = os.path.join(self.sdk, 'sdk', '10.0.101', 'Microsoft.Common.targets')
+        os.makedirs(os.path.dirname(self.targets))
+        with open(self.targets, 'w') as handle:
+            handle.write('<Project/>')
+
+    def manifest(self):
+        os.makedirs(os.path.join(self.work, '.ci-cache'))
+        with open(os.path.join(self.work, '.ci-cache', 'tree-manifest.txt'), 'w') as handle:
+            handle.write('100644 0000000000000000000000000000000000000000 0\tx.txt\n')
+
+    def normalise(self, pinned='true', root=None):
+        return self.run_step('lane', NORMALISE, PINNED=pinned, DOTNET_ROOT=self.sdk if root is None else root)
+
+    def test_the_pinned_sdk_install_is_stamped_old(self):
+        self.manifest()
+        done = self.normalise()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertLess(os.path.getmtime(self.targets), OLD)
+
+    def test_a_cold_build_touches_nothing(self):
+        done = self.normalise()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertGreater(os.path.getmtime(self.targets), OLD)
+
+    def test_an_unpinned_run_leaves_the_images_sdk_alone(self):
+        self.manifest()
+        done = self.normalise(pinned='false')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertGreater(os.path.getmtime(self.targets), OLD)
+
+    def test_an_sdk_outside_the_runner_temp_is_never_touched(self):
+        self.manifest()
+        outside = os.path.join(self.root, 'usr-share-dotnet')
+        os.makedirs(outside)
+        keep = os.path.join(outside, 'dotnet')
+        with open(keep, 'w') as handle:
+            handle.write('x')
+        done = self.normalise(root=outside)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertGreater(os.path.getmtime(keep), OLD)
+
+    def test_a_root_that_only_shares_the_temp_prefix_is_not_the_temp(self):
+        self.manifest()
+        sibling = self.temp + '-other'
+        os.makedirs(sibling)
+        keep = os.path.join(sibling, 'dotnet')
+        with open(keep, 'w') as handle:
+            handle.write('x')
+        done = self.normalise(root=sibling)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertGreater(os.path.getmtime(keep), OLD)
 
 
 if __name__ == '__main__':

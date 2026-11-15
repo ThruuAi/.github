@@ -59,6 +59,10 @@ MUTANTS = {
     'uat is treated as test (gate expression)': sub("(github.base_ref == 'uat' && 'uat' || ", "(false && 'uat' || ", expected=2),
     'the off-dev lane keeps the selector': sub('          if [ "$GATE" != dev ]; then all "the $GATE gate runs everything"; exit 0; fi\n', ''),
     'the off-dev lane keeps the docs-only skip': sub("IGNORE_REGEX: ${{ env.GATE == 'dev' && inputs.docs-only-regex || '' }}", 'IGNORE_REGEX: ${{ inputs.docs-only-regex }}'),
+    'the pinned SDK is never stamped old': sub('            find "$DOTNET_ROOT" -type f -print0 | xargs -0 touch -h -t 200001010000\n', '            true\n'),
+    'the SDK is stamped even when it is not the pinned one': sub('if [ "$PINNED" = "true" ] && [ -n "${DOTNET_ROOT:-}" ]', 'if [ -n "${DOTNET_ROOT:-}" ]'),
+    'the SDK is stamped wherever DOTNET_ROOT points': sub('[ "${DOTNET_ROOT#"$RUNNER_TEMP"/}" != "$DOTNET_ROOT" ] && ', ''),
+    'the SDK is stamped on a cold build too': sub('          if [ ! -s .ci-cache/tree-manifest.txt ]; then\n            echo "::warning::no compiled-output cache from the base branch; this is a cold build"\n            exit 0\n          fi', '          if [ ! -s .ci-cache/tree-manifest.txt ]; then\n            echo "::warning::no compiled-output cache from the base branch; this is a cold build"\n          fi', expected=2),
     'the code-style step runs off dev too': sub(" && github.event_name == 'pull_request' && env.GATE == 'dev'", " && github.event_name == 'pull_request'"),
 }
 
