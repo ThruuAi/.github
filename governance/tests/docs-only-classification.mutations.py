@@ -24,6 +24,7 @@ DIGEST = {n: hashlib.sha256(t.encode()).hexdigest() for n, t in PRISTINE.items()
 
 DECIDE = '''              rc=0
               # Captured, not sent to /dev/null: GNU grep stops at the first match when its output is /dev/null.
+              # shellcheck disable=SC2034  # captured only so that grep reads all of its input
               others="$(printf '%s\\n' "$files" | grep -Ev -- "$IGNORE_REGEX")" || rc=$?
               if [ "$rc" -eq 1 ]; then
 '''
