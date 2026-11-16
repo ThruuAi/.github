@@ -294,6 +294,78 @@ mkdir -p "$out"; printf '<TestRun><ResultSummary><Counters total="{total}" execu
         self.assertEqual(done.returncode, 1, 'the fake writes Shard_1.trx, so a different safe name finds no TRX and fails')
 
 
+RUNS_ON = ("${{ inputs.runner-json != '' && (github.event_name != 'pull_request' || "
+           "github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(inputs.runner-json) || inputs.runner }}")
+SCOPE = 'Compiled output cache scope (the paths it was built at, on a self-hosted runner)'
+
+
+class SelfHostedRoute(unittest.TestCase):
+    """`runner-json` routes a same-repository pull request to a self-hosted pool; everything else keeps `runner`."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = load()
+        cls.on = cls.doc.get('on', cls.doc.get(True))
+        cls.inputs = cls.on['workflow_call']['inputs']
+
+    def test_every_job_takes_the_same_runs_on_expression(self):
+        self.assertEqual({name: job['runs-on'] for name, job in self.doc['jobs'].items()}, {n: RUNS_ON for n in ('lane', 'plan', 'shard', 'ci')})
+
+    def test_runner_json_is_an_optional_string_that_defaults_to_nothing(self):
+        self.assertEqual((self.inputs['runner-json']['type'], self.inputs['runner-json']['required'], self.inputs['runner-json']['default']), ('string', False, ''))
+
+    def test_runner_stays_a_hosted_label_by_default(self):
+        self.assertEqual((self.inputs['runner']['type'], self.inputs['runner']['default']), ('string', 'ubuntu-24.04'))
+
+    def test_the_workflow_never_reads_a_repository_variable_for_the_runner(self):
+        text = open(WORKFLOW, encoding='utf-8').read()
+        self.assertNotIn('vars.', text)
+
+    def test_the_package_token_is_still_the_only_secret(self):
+        self.assertEqual(list(self.on['workflow_call']['secrets']), ['GH_PACKAGES_TOKEN'])
+        self.assertEqual(self.doc['permissions'], {'contents': 'read'})
+        for name, job in self.doc['jobs'].items():
+            self.assertEqual(job['permissions'], {'contents': 'read'}, name)
+
+
+class ObjScope(Scratch):
+    """The compiled-output cache key carries the paths on a self-hosted runner and nothing on a hosted one."""
+
+    count = 0
+
+    def suffix(self, environment, temp=None, workspace=None):
+        ObjScope.count += 1
+        out = os.path.join(self.root, f'out-{ObjScope.count}')
+        done = self.run_step('lane', SCOPE, RUNNER_ENV=environment, RUNNER_TEMP=temp or self.temp, GITHUB_WORKSPACE=workspace or self.work, GITHUB_OUTPUT=out)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return open(out).read().strip()
+
+    def test_a_hosted_runner_keeps_the_old_key(self):
+        self.assertEqual(self.suffix('github-hosted'), 'suffix=')
+
+    def test_a_self_hosted_runner_gets_a_short_hash_of_its_paths(self):
+        self.assertRegex(self.suffix('self-hosted'), r'^suffix=-sh[0-9a-f]{12}$')
+
+    def test_the_same_paths_give_the_same_suffix_and_other_paths_another(self):
+        a = self.suffix('self-hosted', '/r1/_work/_temp', '/r1/_work/omni237/omni237')
+        again = self.suffix('self-hosted', '/r1/_work/_temp', '/r1/_work/omni237/omni237')
+        other_temp = self.suffix('self-hosted', '/r2/_work/_temp', '/r1/_work/omni237/omni237')
+        other_work = self.suffix('self-hosted', '/r1/_work/_temp', '/r2/_work/omni237/omni237')
+        self.assertEqual(a, again)
+        self.assertEqual(len({a, other_temp, other_work}), 3)
+
+    def test_the_lane_and_the_shard_key_and_fall_back_on_the_scope_and_the_scope_step_runs_with_them(self):
+        want = 'obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-'
+        for job in ('lane', 'shard'):
+            steps = self.jobs[job]['steps']
+            obj = [s for s in steps if s.get('id') == 'obj'][0]
+            scope = [s for s in steps if s.get('id') == 'objscope'][0]
+            self.assertEqual(obj['with']['key'], want + '${{ github.sha }}', job)
+            self.assertEqual(obj['with']['restore-keys'], want, job)
+            self.assertEqual(scope['if'], obj['if'], job)
+            self.assertLess(steps.index(scope), steps.index(obj), job)
+
+
 NORMALISE = 'Normalise file times against the cached tree'
 OLD = 950000000   # 2000-01-01 is 946684800; a file stamped "now" is far above this
 

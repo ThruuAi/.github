@@ -30,6 +30,10 @@
 # Everything the v2 header says about job-private NuGet folders, `global-json-sdk` and `static-checks-background` holds
 # unchanged for the lane and for the shards.
 #
+# SELF-HOSTED ROUTING (`runner-json`, omni237#5736). `runner` is one label. A caller that wants a pool (labels, and the
+# runner group as well) passes `runner-json`; it applies only to a pull request from this repository. The compiled-output
+# cache key carries a suffix on a self-hosted runner (see the step "Compiled output cache scope").
+#
 # SECURITY. Read-only token. The package-feed secret reaches the RESTORE steps only, so the build and the tests of the
 # pull request's own code run without it. Callers pin this file by commit SHA.
 name: dotnet-pr-v3
@@ -173,10 +177,21 @@ on:
         required: false
         default: 15
       runner:
-        description: Runner label.
+        description: Runner label (a single GitHub-hosted or self-hosted label). Used when `runner-json` is empty or the pull request is from a fork.
         type: string
         required: false
         default: ubuntu-24.04
+      runner-json:
+        description: >-
+          A JSON runner selector for self-hosted routing, used instead of `runner` when it is not empty AND the pull
+          request comes from this repository (a fork never reaches it: `runner` applies). A JSON string
+          (`"ubuntu-24.04"`), an array of labels (`["self-hosted","linux","x64"]`) or, to pin the runner group as well,
+          `{"group":"<group>","labels":["self-hosted","linux"]}`. The caller builds it from a repository variable and
+          falls back to the hosted label (omni237 pr.yml); this file never reads a variable itself. Default empty:
+          `runner` alone, as before.
+        type: string
+        required: false
+        default: ""
     secrets:
       GH_PACKAGES_TOKEN:
         description: Read-only token for the private package feed (read:packages).
@@ -188,7 +203,7 @@ permissions:
 jobs:
   lane:
     name: lane
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner-json != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(inputs.runner-json) || inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
@@ -365,6 +380,25 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
           restore-keys: nuget-${{ runner.os }}-
 
+      # The compiled output holds absolute paths (the packages folder under $RUNNER_TEMP, the checkout), so a cache built
+      # at one path is not reusable at another, and a persistent runner's paths are not the hosted ones. On a GitHub-hosted
+      # runner the suffix is empty (the key is what it always was). On a self-hosted runner it is a short hash of
+      # $RUNNER_TEMP and $GITHUB_WORKSPACE, so a self-hosted run restores only output built at the same paths, and a hosted
+      # run never restores a self-hosted one (or the reverse). The producer computes the same suffix (omni237 dev-compile.yml).
+      - name: Compiled output cache scope (the paths it was built at, on a self-hosted runner)
+        id: objscope
+        if: steps.scope.outputs.skip != 'true' && inputs.incremental
+        env:
+          RUNNER_ENV: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "$RUNNER_ENV" != "github-hosted" ]; then
+            suffix="-sh$(printf '%s\n%s\n' "$RUNNER_TEMP" "$GITHUB_WORKSPACE" | sha256sum | cut -c1-12)"
+          fi
+          echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
+          echo "compiled-output cache scope: '${suffix:-hosted}'"
+
       # Compiled output of the dev tip (saved by the repository's dev push, never by a pull request:
       # a cache written under a PR ref is invisible to every other PR). Prefix match picks the newest.
       - name: Compiled output (restore obj/ from dev)
@@ -375,8 +409,8 @@ jobs:
           path: |
             src/**/obj
             .ci-cache
-          key: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}
-          restore-keys: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-
+          key: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}
+          restore-keys: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-
 
       # Fail closed. The BASE's copy runs (the head must not choose how its own times are normalised).
       # A missing copy at the base (the first adoption) or a missing cache leaves every file stamped
@@ -610,7 +644,7 @@ jobs:
   plan:
     name: plan
     if: ${{ github.event_name == 'pull_request' && (github.base_ref == 'test' || github.base_ref == 'main' || github.base_ref == 'uat') }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner-json != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(inputs.runner-json) || inputs.runner }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -659,7 +693,7 @@ jobs:
     name: ${{ matrix.shard.label }}
     needs: plan
     if: ${{ needs.plan.result == 'success' }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner-json != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(inputs.runner-json) || inputs.runner }}
     timeout-minutes: ${{ inputs.shard-timeout-minutes }}
     permissions:
       contents: read
@@ -755,6 +789,25 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
           restore-keys: nuget-${{ runner.os }}-
 
+      # The compiled output holds absolute paths (the packages folder under $RUNNER_TEMP, the checkout), so a cache built
+      # at one path is not reusable at another, and a persistent runner's paths are not the hosted ones. On a GitHub-hosted
+      # runner the suffix is empty (the key is what it always was). On a self-hosted runner it is a short hash of
+      # $RUNNER_TEMP and $GITHUB_WORKSPACE, so a self-hosted run restores only output built at the same paths, and a hosted
+      # run never restores a self-hosted one (or the reverse). The producer computes the same suffix (omni237 dev-compile.yml).
+      - name: Compiled output cache scope (the paths it was built at, on a self-hosted runner)
+        id: objscope
+        if: inputs.incremental
+        env:
+          RUNNER_ENV: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "$RUNNER_ENV" != "github-hosted" ]; then
+            suffix="-sh$(printf '%s\n%s\n' "$RUNNER_TEMP" "$GITHUB_WORKSPACE" | sha256sum | cut -c1-12)"
+          fi
+          echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
+          echo "compiled-output cache scope: '${suffix:-hosted}'"
+
       # Compiled output of the dev tip (saved by the repository's dev push, never by a pull request:
       # a cache written under a PR ref is invisible to every other PR). Prefix match picks the newest.
       - name: Compiled output (restore obj/ from dev)
@@ -765,8 +818,8 @@ jobs:
           path: |
             src/**/obj
             .ci-cache
-          key: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}
-          restore-keys: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-
+          key: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}
+          restore-keys: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-
 
       # Fail closed. The BASE's copy runs (the head must not choose how its own times are normalised).
       # A missing copy at the base (the first adoption) or a missing cache leaves every file stamped
@@ -860,7 +913,7 @@ jobs:
     name: ci
     needs: [lane, plan, shard]
     if: ${{ always() }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner-json != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(inputs.runner-json) || inputs.runner }}
     timeout-minutes: 5
     permissions:
       contents: read

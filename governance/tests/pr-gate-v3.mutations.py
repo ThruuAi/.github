@@ -63,6 +63,15 @@ MUTANTS = {
     'the SDK is stamped even when it is not the pinned one': sub('if [ "$PINNED" = "true" ] && [ -n "${DOTNET_ROOT:-}" ]', 'if [ -n "${DOTNET_ROOT:-}" ]'),
     'the SDK is stamped wherever DOTNET_ROOT points': sub('[ "${DOTNET_ROOT#"$RUNNER_TEMP"/}" != "$DOTNET_ROOT" ] && ', ''),
     'the SDK is stamped on a cold build too': sub('          if [ ! -s .ci-cache/tree-manifest.txt ]; then\n            echo "::warning::no compiled-output cache from the base branch; this is a cold build"\n            exit 0\n          fi', '          if [ ! -s .ci-cache/tree-manifest.txt ]; then\n            echo "::warning::no compiled-output cache from the base branch; this is a cold build"\n          fi', expected=2),
+    'a fork pull request can reach runner-json': sub("(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ", '', expected=4),
+    'an empty runner-json is parsed instead of falling back to runner': sub("inputs.runner-json != '' && ", '', expected=4),
+    'the plan keeps the hosted label while the lane goes self-hosted': sub("    if: ${{ github.event_name == 'pull_request' && (github.base_ref == 'test' || github.base_ref == 'main' || github.base_ref == 'uat') }}\n    runs-on: ${{ inputs.runner-json != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(inputs.runner-json) || inputs.runner }}\n", "    if: ${{ github.event_name == 'pull_request' && (github.base_ref == 'test' || github.base_ref == 'main' || github.base_ref == 'uat') }}\n    runs-on: ${{ inputs.runner }}\n"),
+    'the self-hosted suffix is dropped': sub('            suffix="-sh$(printf', '            suffix="$(printf', expected=2),
+    'the self-hosted suffix ignores the workspace': sub('"$RUNNER_TEMP" "$GITHUB_WORKSPACE" | sha256sum', '"$RUNNER_TEMP" "$RUNNER_TEMP" | sha256sum', expected=2),
+    'the hosted run also gets a suffix': sub('if [ "$RUNNER_ENV" != "github-hosted" ]; then', 'if true; then', expected=2),
+    'the lane key ignores the scope': sub("          key: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}\n", "          key: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}\n", expected=2),
+    'the restore prefix ignores the scope': sub("          restore-keys: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-\n", "          restore-keys: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-\n", expected=2),
+    'the workflow reads a repository variable for the runner': sub("    timeout-minutes: 5\n    permissions:\n      contents: read\n    outputs:", "    timeout-minutes: 5\n    env:\n      X: ${{ vars.CI_DEV_LANE_RUNNER_JSON }}\n    permissions:\n      contents: read\n    outputs:"),
     'the code-style step runs off dev too': sub(" && github.event_name == 'pull_request' && env.GATE == 'dev'", " && github.event_name == 'pull_request'"),
 }
 
