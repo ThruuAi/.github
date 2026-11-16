@@ -72,6 +72,8 @@ MUTANTS = {
     'the lane key ignores the scope': sub("          key: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}\n", "          key: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-${{ github.sha }}\n", expected=2),
     'the restore prefix ignores the scope': sub("          restore-keys: obj-v1-${{ runner.os }}${{ steps.objscope.outputs.suffix }}-${{ steps.sdk.outputs.version }}-\n", "          restore-keys: obj-v1-${{ runner.os }}-${{ steps.sdk.outputs.version }}-\n", expected=2),
     'the workflow reads a repository variable for the runner': sub("    timeout-minutes: 5\n    permissions:\n      contents: read\n    outputs:", "    timeout-minutes: 5\n    env:\n      X: ${{ vars.CI_DEV_LANE_RUNNER_JSON }}\n    permissions:\n      contents: read\n    outputs:"),
+    'the build servers are stopped only when the job passed': sub("        if: always()\n        run: dotnet build-server shutdown || true\n", "        run: dotnet build-server shutdown || true\n", expected=2),
+    'the build servers are never stopped': sub("        run: dotnet build-server shutdown || true\n", "        run: 'true'\n", expected=2),
     'the code-style step runs off dev too': sub(" && github.event_name == 'pull_request' && env.GATE == 'dev'", " && github.event_name == 'pull_request'"),
 }
 

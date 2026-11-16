@@ -328,6 +328,14 @@ class SelfHostedRoute(unittest.TestCase):
             self.assertEqual(job['permissions'], {'contents': 'read'}, name)
 
 
+class BuildServers(unittest.TestCase):
+    def test_the_lane_and_the_shard_end_by_stopping_the_build_servers_whatever_happened(self):
+        jobs = load()['jobs']
+        for job in ('lane', 'shard'):
+            last = jobs[job]['steps'][-1]
+            self.assertEqual((last['name'], last['if'], last['run']), ('Stop the build servers', 'always()', 'dotnet build-server shutdown || true'), job)
+
+
 class ObjScope(Scratch):
     """The compiled-output cache key carries the paths on a self-hosted runner and nothing on a hosted one."""
 

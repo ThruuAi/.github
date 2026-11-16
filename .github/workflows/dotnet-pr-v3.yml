@@ -638,6 +638,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # A persistent self-hosted runner outlives the job: stop the build servers the job started (the Roslyn compiler server
+      # would otherwise stay up for its idle timeout, holding this job's workspace). Harmless on a hosted runner.
+      - name: Stop the build servers
+        if: always()
+        run: dotnet build-server shutdown || true
+
   # The matrix of the test and uat gates, printed by the caller's own command. It runs the head's script on the merge
   # checkout: that is the same trust as running the head's tests (a pull request can edit those too; the reviewer of a
   # `.github/**` or `infra/ci/**` change reads it), and it never sees the package token.
@@ -907,6 +913,12 @@ jobs:
           path: ${{ runner.temp }}/trx/**
           if-no-files-found: ignore
           retention-days: 7
+
+      # A persistent self-hosted runner outlives the job: stop the build servers the job started (the Roslyn compiler server
+      # would otherwise stay up for its idle timeout, holding this job's workspace). Harmless on a hosted runner.
+      - name: Stop the build servers
+        if: always()
+        run: dotnet build-server shutdown || true
 
   # THE CHECK a ruleset requires (`<caller job> / ci`). It runs always: a required check that is skipped counts as passed.
   ci:
