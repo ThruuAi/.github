@@ -57,8 +57,11 @@
 #   GH_CONFIG_DIR   an EMPTY directory of this identity's, so the real gh finds
 #                   no stored login.
 #   MM_REAL_GH_BIN  the absolute path of the real gh found before the shim was
-#                   installed, for helpers that must call it directly. Unset
-#                   when this environment is locked.
+#                   installed, for helpers that must call it directly. It is
+#                   the path PATH names (Homebrew's /opt/homebrew/bin/gh link),
+#                   never the versioned Cellar path that link points to, so a
+#                   `brew upgrade` is followed by the next command with no
+#                   re-eval. Unset when this environment is locked.
 #   git identity    author and committer are the App's bot user.
 #   git credentials for github.com: the helper list is reset, then one helper
 #                   mints a token for each operation, and tells git to stop
@@ -279,6 +282,7 @@ except (OSError, ValueError, TypeError):
 PY_DOCTOR_RECORD
 )" || doctor_fail InstallationRecordInvalid
   { IFS= read -r revision && IFS= read -r real; } <<<"$values" || doctor_fail InstallationRecordInvalid
+  [[ -f "$real" && -x "$real" ]] || doctor_fail RealGhMissing
   local shim="$dir/shim/$revision" pins="$dir/shim/$revision/launcher-pins.json"
   [[ -f "$pins" && ! -L "$pins" && -r "$pins" ]] || doctor_fail PinsMissing
   scratch_base="${TMPDIR:-$HOME/repo/_work}"
@@ -360,7 +364,10 @@ on_exit() {
 trap on_exit EXIT
 
 # PATH without any directory of ours (a previous eval's shim), so evals do not
-# stack, and the gh found here is the real one, never a shim.
+# stack, and the gh found here is the real one, never a shim. The path kept is
+# the one PATH names: a Homebrew link is not resolved to its versioned target,
+# which a brew upgrade would leave stale. Only the target is checked against
+# ours, so a link that resolves into mm-agent is still refused.
 clean_path=""
 real_gh=""
 root_canon="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ROOT" 2>/dev/null)" \
@@ -374,7 +381,7 @@ for d in ${path_dirs[@]+"${path_dirs[@]}"}; do
     candidate_canon="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$d/gh" 2>/dev/null)" || continue
     [[ "$candidate_canon" == /* && -f "$candidate_canon" && -x "$candidate_canon" ]] || continue
     case "$candidate_canon" in "$root_canon" | "$root_canon"/*) continue ;; esac
-    real_gh="$candidate_canon"
+    real_gh="$d/gh"
   fi
 done
 
@@ -620,7 +627,7 @@ env_script() {
 # commit: $commit
 # Both canonical launcher hashes were pinned by the installer. Every source
 # verifies the current regular executable pair before making identity usable.
-if [ -x $(q "$BIN/gh") ] && [ -x $(q "$BIN/mm-gh-org") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ] && \
+if [ -x $(q "$BIN/gh") ] && [ -x $(q "$BIN/mm-gh-org") ] && [ -x $(q "$LIBEXEC/gh-shim.sh") ] && [ -x $(q "$TOKEN_CMD") ] && [ -r $(q "$ZD/reassert.zsh") ] && [ -x $(q "$real_gh") ] && \
 python3 -I -S - $(q "$BIN/gh") $(q "$BIN/mm-gh-org") $(q "$PIN_FILE") 2>/dev/null <<'MM_AGENT_LAUNCHER_HASHES'
 import hashlib, json, os, re, stat, sys
 try:
@@ -646,7 +653,7 @@ $(owner_zdotdir_lines)
 $body
 $(path_lines "$BIN")
 else
-echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is missing or changed ($SHIM); nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
+echo $(q "agent-env.sh ($NAME): the gh shim of commit ${commit:0:12} is missing or changed ($SHIM), or the real gh ($real_gh) is not executable; nothing was set up. Eval agent-env.sh from a checkout of a merged commit to install one.") >&2
 unset MM_REAL_GH_BIN
 GH_TOKEN=$(q "$SENTINEL"); export GH_TOKEN
 false
