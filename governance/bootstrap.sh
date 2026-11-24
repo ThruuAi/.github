@@ -83,7 +83,7 @@
 #
 # Product structure lives in each product repository, never here (DELIVERY §6):
 # it reads .github/governance/{areas.txt, required-checks.txt,
-# required-checks.dev.txt, required-checks.main.txt} from each repo's `dev`
+# required-checks.main.txt} from each repo's `dev`
 # branch, or from --config-dir <dir>/<repo>/ for local testing.
 #
 # The branch model (DELIVERY §9.1): dev is the integration default every Task
@@ -537,15 +537,16 @@ for repo in ${REPOS[@]+"${REPOS[@]}"}; do
   fetch "repos/$ORG/$repo" || { echo "Repository $ORG/$repo not found" >&2; exit 1; }
   load_config "$repo" areas.txt required
   load_config "$repo" required-checks.txt required
-  # required-checks.dev.txt is optional: its absence is a repository that adds
-  # no dev-only checks, and the dev ruleset still requires issue-link and the
-  # independent review. Reported, never a failure.
+  # required-checks.dev.txt is no longer read (owner flow 2026-11-24: dev runs
+  # no CI and requires review/independent alone). A repository that still has
+  # lines in it is warned, never obeyed: a required check dev never runs would
+  # hang every pull request into dev.
   load_config "$repo" required-checks.dev.txt optional
-  load_config "$repo" required-checks.main.txt optional
-  info "$repo: $(config_lines "$WORK/cfg/$repo/areas.txt" | wc -l | tr -d ' ') areas, $(config_lines "$WORK/cfg/$repo/required-checks.txt" | wc -l | tr -d ' ') required checks on test (+$(config_lines "$WORK/cfg/$repo/required-checks.dev.txt" | wc -l | tr -d ' ') on dev, +$(config_lines "$WORK/cfg/$repo/required-checks.main.txt" | wc -l | tr -d ' ') on main)"
-  if [[ "$(config_lines "$WORK/cfg/$repo/required-checks.dev.txt" | wc -l | tr -d ' ')" == "0" ]]; then
-    info "$repo: no .github/governance/required-checks.dev.txt; the dev ruleset requires issue-link and review/independent alone."
+  if [[ "$(config_lines "$WORK/cfg/$repo/required-checks.dev.txt" | wc -l | tr -d ' ')" != "0" ]]; then
+    warn "$repo: .github/governance/required-checks.dev.txt lists checks but is IGNORED: the dev ruleset requires review/independent alone (dev runs no CI). Delete the file."
   fi
+  load_config "$repo" required-checks.main.txt optional
+  info "$repo: $(config_lines "$WORK/cfg/$repo/areas.txt" | wc -l | tr -d ' ') areas, $(config_lines "$WORK/cfg/$repo/required-checks.txt" | wc -l | tr -d ' ') required checks on test (+$(config_lines "$WORK/cfg/$repo/required-checks.main.txt" | wc -l | tr -d ' ') on main); dev requires review/independent alone."
 done
 
 # ------------------------------------------------------ a) issue types ----
@@ -648,6 +649,29 @@ for repo in ${REPOS[@]+"${REPOS[@]}"}; do
 done
 
 # -------------------------------------------------------- d) rulesets ----
+# The required checks of each product branch, in one place (owner flow
+# 2026-11-24: dev runs no CI, so nothing on dev may wait on a runner job).
+# One line per branch: the repository check files it reads (a subset of
+# test, dev, main; none for dev), then the extra contexts the standard adds,
+# then who issues the two Checks App contexts. review/independent, pinned to
+# the Reviewer App, is added to dev and test by required_checks_json.
+#   branch  files        extra contexts                                issuer
+#   dev     (none)       (none)                                        -
+#   test    test         test-source-policy governance/issue-link      checks
+#   main    test main    main-source-policy governance/issue-link      checks
+# A new check on dev is a change to this table and to its test, never a
+# per-repository file: required-checks.dev.txt is no longer read.
+branch_checks_json() {
+  # $1: dev | test | main, $2: the repository's config directory
+  local cfg="$2"
+  case "$1" in
+    dev)  required_checks_json review none "$ACTIONS_APP_ID" ;;
+    test) required_checks_json review "test-source-policy governance/issue-link" "$CHECKS_APP_ID" "$cfg/required-checks.txt" ;;
+    main) required_checks_json none "main-source-policy governance/issue-link" "$CHECKS_APP_ID" "$cfg/required-checks.txt" "$cfg/required-checks.main.txt" ;;
+    *) echo "branch_checks_json: unknown branch $1" >&2; return 1 ;;
+  esac
+}
+
 # required_status_checks entries: every Actions check pinned to the Actions app,
 # plus review/independent pinned to the Reviewer App when its id is known.
 required_checks_json() {
@@ -671,9 +695,12 @@ required_checks_json() {
 # dev-integration (DELIVERY §9.1): the integration default. Pull request, no
 # approvals (the review is the pinned review/independent check), no force push,
 # no deletion, no bypass for anyone, merge commits only. Any branch may open a
-# pull request into dev; the dev checks are the repository's
-# required-checks.dev.txt (optional) plus governance/issue-link.
+# pull request into dev; the only required check is review/independent (see
+# branch_checks_json). dev runs no CI, so a required governance/issue-link
+# would wait forever on a job nothing starts: refused here, whatever the table says.
 dev_ruleset() {
+  jq -e 'all(.[]; .context == "review/independent")' <<<"$1" >/dev/null \
+    || { echo "dev-integration may require only review/independent; got: $(jq -c '[.[].context]' <<<"$1")" >&2; exit 1; }
   jq -n --argjson checks "$1" --argjson strict "$STRICT_UP_TO_DATE" '{
     name: "dev-integration", target: "branch", enforcement: "active",
     bypass_actors: [],
@@ -856,12 +883,12 @@ for repo in ${RULESET_REPOS[@]+"${RULESET_REPOS[@]}"}; do
     payloads=("$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json")
   else
     cfg="$WORK/cfg/$repo"
-    # dev gets the repository's optional dev checks, issue-link, and the
-    # independent review; test adds the source policy and the full test checks;
+    # Each branch's checks come from branch_checks_json: dev the independent
+    # review alone; test adds the source policy, issue-link and the test checks;
     # main adds the source policy, issue-link and the main-only checks.
-    dev_ruleset "$(required_checks_json review "governance/issue-link" "$ACTIONS_APP_ID" "$cfg/required-checks.dev.txt")" >"$WORK/rs-dev-$repo.json"
-    test_ruleset "$(required_checks_json review "test-source-policy governance/issue-link" "$CHECKS_APP_ID" "$cfg/required-checks.txt")" >"$WORK/rs-test-$repo.json"
-    main_checks_ruleset "$(required_checks_json none "main-source-policy governance/issue-link" "$CHECKS_APP_ID" "$cfg/required-checks.txt" "$cfg/required-checks.main.txt")" >"$WORK/rs-main-checks-$repo.json"
+    dev_ruleset "$(branch_checks_json dev "$cfg")" >"$WORK/rs-dev-$repo.json"
+    test_ruleset "$(branch_checks_json test "$cfg")" >"$WORK/rs-test-$repo.json"
+    main_checks_ruleset "$(branch_checks_json main "$cfg")" >"$WORK/rs-main-checks-$repo.json"
     payloads=("$WORK/rs-dev-$repo.json" "$WORK/rs-test-$repo.json" "$WORK/rs-main-owner-$repo.json" "$WORK/rs-main-checks-$repo.json")
   fi
   main_owner_ruleset >"$WORK/rs-main-owner-$repo.json"

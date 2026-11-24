@@ -829,10 +829,30 @@ if (process.env.BOOTSTRAP_CHECKS_ONLY === '1' || process.env.BOOTSTRAP_DRIFT_ONL
       && [d, t].every((rs) => rs.body.bypass_actors.length === 0
         && rs.body.rules.some((x) => x.type === 'deletion') && rs.body.rules.some((x) => x.type === 'non_fast_forward')),
     `${d && JSON.stringify(d.body.bypass_actors)} ${t && JSON.stringify(t.body.bypass_actors)}`);
-  ok('dev-integration requires the dev checks, governance/issue-link and review/independent pinned to the Reviewer App',
-    d && checks(d.body).some((c) => c.context === 'governance/issue-link' && c.integration_id === 15368)
-      && checks(d.body).some((c) => c.context === 'review/independent' && c.integration_id === REVIEWER_ID),
+  ok('dev-integration requires review/independent pinned to the Reviewer App and nothing else (owner flow 2026-11-24: dev runs no CI)',
+    d && JSON.stringify(checks(d.body)) === JSON.stringify([{ context: 'review/independent', integration_id: REVIEWER_ID }]),
     d && JSON.stringify(checks(d.body)));
+  ok('dev-integration NEVER requires governance/issue-link, from either issuer: it would wait on a job dev does not start',
+    d && !checks(d.body).some((c) => c.context === 'governance/issue-link'), d && JSON.stringify(checks(d.body)));
+  for (const [name, rs] of [['test-integration', t], ['main-checks', m]]) {
+    ok(`${name} keeps governance/issue-link pinned to the Checks App`,
+      rs && checks(rs.body).some((c) => c.context === 'governance/issue-link' && c.integration_id === CHECKS_ID),
+      rs && JSON.stringify(checks(rs.body)));
+  }
+  // A repository that still carries required-checks.dev.txt is warned and its
+  // lines ignored: dev's rule set is the bootstrap's table, not a repo file.
+  const devFile = path.join(cfg, 'prod', 'required-checks.dev.txt');
+  fs.writeFileSync(devFile, 'build\ngovernance/issue-link\n');
+  try {
+    const withFile = bootstrap([]);
+    const dd = planned(withFile.stdout)['prod/dev-integration'];
+    ok('a repository required-checks.dev.txt is warned about and ignored: dev still requires review/independent alone',
+      withFile.status === 0 && /required-checks\.dev\.txt lists checks but is IGNORED/.test(withFile.stdout) && dd
+        && JSON.stringify(checks(dd.body).map((c) => c.context)) === '["review/independent"]',
+      `${tail(withFile)} ${dd && JSON.stringify(checks(dd.body))}`);
+  } finally {
+    fs.unlinkSync(devFile);
+  }
   ok('test-integration requires governance/issue-link, test-source-policy and review/independent',
     t && checks(t.body).some((c) => c.context === 'governance/issue-link' && c.integration_id === CHECKS_ID)
       && checks(t.body).some((c) => c.context === 'test-source-policy' && c.integration_id === 15368)

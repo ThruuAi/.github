@@ -40,7 +40,6 @@ the default branch, or those three forms open issues with no type.
 ```text
 .github/governance/areas.txt                 areas, as label lines plus path globs
 .github/governance/required-checks.txt       CI checks required on test and main
-.github/governance/required-checks.dev.txt   extra checks required on dev only (optional)
 .github/governance/required-checks.main.txt  extra checks required on main only
 .github/governance/HOTSPOTS.md               its hot shared files (see HOTSPOTS-GUIDE.md)
 .github/workflows/pr-governance.yml          the caller below
@@ -66,9 +65,12 @@ same repository**: a fork can name a branch `dev`, `main` or `hotfix/*`, so the
 check compares GitHub's own base and head repository full names with this
 repository and fails closed on a fork, a deleted repository or a mismatch. A
 pull request into `dev` still takes any source.
-`required-checks.txt` applies on `test` and `main`;
-`required-checks.dev.txt` lists only the checks the integration branch adds,
-and may be absent.
+`required-checks.txt` applies on `test` and `main`. `dev` takes no repository
+checks: it runs no CI and requires `review/independent` alone (owner flow
+2026-11-24). Each branch's checks are one table, `branch_checks_json` in
+`governance/bootstrap.sh`; a `required-checks.dev.txt` a repository still holds
+is warned about and ignored, and the bootstrap refuses to build a `dev` rule set
+that names anything but `review/independent`.
 
 `areas.txt`:
 
@@ -1032,10 +1034,12 @@ itself, so its `test` and `main` require a pull request, `governance tests`, and
 four rulesets below.
 
 - **`dev-integration`**: on `dev`, the integration default. Pull request, no
-  approvals. The optional `required-checks.dev.txt` + `governance/issue-link`,
-  all pinned to the Actions app, plus `review/independent` pinned to the
-  Reviewer App. Any branch may open a pull request into `dev`. Merge commits
-  only, no force push, no deletion, no bypass.
+  approvals. Requires `review/independent`, pinned to the Reviewer App, and
+  nothing else: `dev` runs no CI, so a required `governance/issue-link` would
+  wait forever (owner flow 2026-11-24;
+  `governance/tests/bootstrap.test.js` fails if it returns). Any branch may open
+  a pull request into `dev`. Merge commits only, no force push, no deletion, no
+  bypass.
 - **`test-integration`**: on `test`. Pull request, no approvals. The repo's
   required checks + `governance/issue-link` + `test-source-policy`; the two
   Checks App contexts use its id, the remaining checks use Actions, plus `review/independent` pinned to the Reviewer App. The
