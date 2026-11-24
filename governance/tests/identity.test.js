@@ -141,7 +141,6 @@ require('fs').appendFileSync(process.env.FAKE_REAL_GH_LOG, JSON.stringify({
 console.log('real gh ran: ' + process.argv.slice(2).join(' '));
 process.exit(Number(process.env.FAKE_REAL_GH_EXIT || 0));
 `, { mode: 0o755 });
-const REAL_GH_CANON = fs.realpathSync(REAL_GH);
 
 // The gh the owner's startup files put first (Homebrew's, on the owner's
 // machine). Like the real one it answers `gh auth token` with GH_TOKEN when
@@ -347,7 +346,7 @@ function zshOrSkip(what) {
     if (!fs.existsSync(pinPath())) fs.writeFileSync(pinPath(), JSON.stringify({ gh: sha(path.join(SHIM(), 'bin', 'gh')),
       'mm-gh-org': sha(path.join(SHIM(), 'bin', 'mm-gh-org')) }), { mode: 0o600 });
     if (!fs.existsSync(recordPath)) fs.writeFileSync(recordPath, JSON.stringify({ version: 1, profile: NAME, commit: COMMIT,
-      real_gh: REAL_GH_CANON }), { mode: 0o600 });
+      real_gh: REAL_GH }), { mode: 0o600 });
     return { result: r, emittedState };
   };
   const probe = (name, reason) => {
@@ -385,6 +384,11 @@ function zshOrSkip(what) {
     setup(); const changed = JSON.parse(readOr(pinPath())); changed[launcher] = '0'.repeat(64);
     fs.writeFileSync(pinPath(), JSON.stringify(changed)); probe(`changed ${launcher} pin`, 'CanonicalMismatch');
   }
+  // The gh the installation names is gone (a link into a Cellar that a brew
+  // upgrade removed): the doctor says so before it reads anything else.
+  setup(); fs.renameSync(REAL_GH, `${REAL_GH}.away`);
+  probe('real gh missing', 'RealGhMissing');
+  fs.renameSync(`${REAL_GH}.away`, REAL_GH);
 
   // The pin-file representation retains fail-closed acceptance on every
   // source, including wrong shape/type and a same-bytes symlink.
@@ -625,7 +629,7 @@ function zshOrSkip(what) {
     w.stdout.trim().startsWith(`${DIR}/`) && w.stdout.trim() !== REAL_GH, w.stdout.trim() || w.stderr.trim());
   const real = inChild(printed, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
   ok('agent-env exports the absolute real gh path it found before installing the shim',
-    field(real.stdout, 'real-gh') === REAL_GH_CANON, real.stdout.trim());
+    field(real.stdout, 'real-gh') === REAL_GH, real.stdout.trim());
 
   const old = run(['-c', 'gh() { echo OLD; }; eval "$1"; type -t gh', '_', printed]);
   ok('a gh() function left by an older agent-env.sh is replaced by the shim', old.stdout.trim() === 'file', old.stdout.trim());
@@ -653,7 +657,7 @@ function zshOrSkip(what) {
   const printed = discovery.stdout;
   const discoveredPath = inChild(printed, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
   ok('agent-env skips an external PATH symlink whose target is inside mm-agent',
-    discovery.status === 0 && field(discoveredPath.stdout, 'real-gh') === REAL_GH_CANON,
+    discovery.status === 0 && field(discoveredPath.stdout, 'real-gh') === REAL_GH,
     `status=${discovery.status}; discovered=${field(discoveredPath.stdout, 'real-gh')}`);
   const post = `${JSON.stringify(POST_REVIEW)} marvinamiranda/omni237 ${REVIEW_SHA} success ${JSON.stringify('fixture review')}`;
   const before = records(curlLog).length;
@@ -670,7 +674,7 @@ function zshOrSkip(what) {
   let payload = null;
   try { payload = call ? JSON.parse(call.input) : null; } catch {}
   ok('post-review succeeds with the mm-agent shim first on PATH',
-    result.status === 0 && field(result.stdout, 'shim') === agentShim && field(result.stdout, 'real') === REAL_GH_CANON
+    result.status === 0 && field(result.stdout, 'shim') === agentShim && field(result.stdout, 'real') === REAL_GH
       && calls.length === 1 && call.args[0] === 'api' && call.args.includes('repos/marvinamiranda/omni237/check-runs')
       && call.args.includes('--hostname') && call.args[call.args.indexOf('--hostname') + 1] === 'github.com',
     `status=${result.status}; shim=${field(result.stdout, 'shim')}; real=${field(result.stdout, 'real')}; calls=${calls.length}`);
@@ -718,6 +722,63 @@ function zshOrSkip(what) {
     `source ${JSON.stringify(path.join(DIR, 'env'))}; printf 'real-gh=%s\\n' "\${MM_REAL_GH_BIN-unset}"`);
   ok('the installed environment clears MM_REAL_GH_BIN when its shim is missing',
     field(missingShim.stdout, 'real-gh') === 'unset', missingShim.stdout.trim());
+})();
+
+// ---------------------------------- the gh link is followed, not pinned ----
+// Homebrew's /opt/homebrew/bin/gh is a link into a versioned Cellar. What the
+// installed identity records must be the link, so a `brew upgrade` is followed
+// by the next command with no re-eval; the versioned path is never written; and
+// a missing gh stops the next command rather than falling back to another gh.
+(function stableGhLink() {
+  fresh();
+  const fakeGh = (version) => {
+    const dir = path.join(root, 'Cellar', 'gh', version, 'bin');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'gh');
+    fs.writeFileSync(file, `#!/usr/bin/env node
+require('fs').appendFileSync(process.env.FAKE_REAL_GH_LOG, JSON.stringify({
+  token: process.env.GH_TOKEN === undefined ? null : process.env.GH_TOKEN,
+  config: process.env.GH_CONFIG_DIR === undefined ? null : process.env.GH_CONFIG_DIR,
+  version: ${JSON.stringify(version)}, args: process.argv.slice(2), input: '' }) + '\\n');
+console.log('gh ${version}');
+`, { mode: 0o755 });
+    return file;
+  };
+  const versioned = path.join(root, 'Cellar', 'gh', '2.102.0', 'bin', 'gh');
+  const linkDir = path.join(root, 'homebrew-bin');
+  const link = path.join(linkDir, 'gh');
+  fs.mkdirSync(linkDir, { recursive: true });
+  fs.symlinkSync(fakeGh('2.102.0'), link);
+  const envFile = path.join(DIR, 'env');
+  const shellRun = (script) => run(['-c', `. ${JSON.stringify(envFile)} && ${script}`]);
+
+  const r = agentEnv({ PATH: [stubBin, linkDir, path.dirname(process.execPath), SYS_PATH].join(':') });
+  const real = inChild(r.stdout, 'printf "real-gh=%s\\n" "$MM_REAL_GH_BIN"');
+  ok('agent-env records the Homebrew link PATH names, not the versioned Cellar path it points to',
+    r.status === 0 && field(real.stdout, 'real-gh') === link, `status=${r.status}; real-gh=${field(real.stdout, 'real-gh')}`);
+  const written = [r.stdout, readOr(envFile), readOr(path.join(DIR, 'installation.json'))].join('\n');
+  ok('no file agent-env.sh writes names the versioned Cellar path',
+    !written.includes(versioned) && written.includes(link), `versioned-named=${written.includes(versioned)}`);
+
+  fs.writeFileSync(ghLog, '');
+  const first = shellRun('gh api user');
+  ok('a new shell that sources the env runs the gh the link points to',
+    first.status === 0 && ghRuns().at(-1)?.version === '2.102.0', `status=${first.status}; ${first.stderr.trim()}`);
+
+  fs.rmSync(link);
+  fs.symlinkSync(fakeGh('2.105.0'), link);
+  fs.writeFileSync(ghLog, '');
+  const upgraded = shellRun('gh api user');
+  ok('after the link moves to a new gh, the next shell runs it with no re-eval',
+    upgraded.status === 0 && ghRuns().at(-1)?.version === '2.105.0', `status=${upgraded.status}; ${upgraded.stderr.trim()}`);
+
+  fs.rmSync(link);
+  fs.writeFileSync(ghLog, '');
+  const gone = shellRun('echo AFTER-SOURCE-RAN');
+  ok('with the link gone, sourcing the env fails with a message and the next command does not run',
+    gone.status !== 0 && !gone.stdout.includes('AFTER-SOURCE-RAN') && ghRuns().length === 0
+      && gone.stderr.includes('agent-env.sh (mm-agent)'),
+    `status=${gone.status}; ${gone.stderr.trim().split('\n').pop()}`);
 })();
 
 // ------------------------------------ R1: zsh login and interactive shells ----
