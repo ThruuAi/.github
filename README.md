@@ -84,6 +84,17 @@ Globs: `*` within a path segment, `**` across segments, `{a,b}` either.
 a required check that never starts is a merge freeze. Where a workflow is
 path-filtered, require its always-running aggregator instead (DELIVERY §10).
 
+## .NET PR lane v4 (`dotnet-pr-v4.yml`)
+
+Self-hosted only (owner order 2026-11-24). v3 is untouched, for the callers that still use it. A caller passes the runners as
+JSON label arrays and nothing defaults to a hosted one: `runner-heavy` (the lane), `runner-light` (the plan and the
+verdict) and `shard-runners` (a JSON array of label arrays; shard i runs on entry i mod N, so two entries split the
+shards in half, and a repeated entry weights it). An empty value fails the run, `plan` refuses a shard runner that does not
+name `self-hosted`, that names a hosted label or that names the tst host (`tst-deploy`, `oci-linux`), and the first step of every job fails unless `RUNNER_ENVIRONMENT` is
+`self-hosted`. `max-shards` makes the plan fail above a cap on the fan-out; the shard timeout defaults to 60 minutes. The
+compiled-output cache key carries the architecture off X64 only, so an ARM64 shard never restores an X64 producer's obj/.
+Tests and mutation proof: `governance/tests/pr-gate-v4.test.py` and `pr-gate-v4.mutations.py`.
+
 ## .NET PR lane v2 (`dotnet-pr-v2.yml`)
 
 A second, separate reusable workflow beside `dotnet-pr.yml` (v1 is untouched; callers move by changing the
