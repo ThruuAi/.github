@@ -47,7 +47,10 @@ const mutants = [
   ['wf', 'any App id is accepted', "if (process.env.AGENT_APP_ID !== '5075705' || process.env.REVIEWER_APP_ID !== '5075711')", 'if (false)'],
   ['wf', 'the runner is not checked', "if (pattern && !new RegExp(pattern).test(process.env.RUNNER_NAME || ''))", 'if (false)'],
   ['lib', 'a permission outage drops a CHANGES', "if (strict && !(error && error.status === 404)) throw error;", ''],
-  ['wf', 'a refusal is not reported', "if: always() && github.event.issue.number", "if: steps.merge.outputs.merged == 'true'"],
+  ['wf', 'a refusal is not reported', "if: always() && needs.merge.result != 'skipped'", "if: needs.merge.result == 'success'"],
+  ['wf', 'the merge job can comment', "      contents: read\n      issues: read\n      pull-requests: read", "      contents: read\n      issues: write\n      pull-requests: write"],
+  ['wf', 'the report job gets more than pull-requests: write', "    permissions:\n      pull-requests: write\n", "    permissions:\n      pull-requests: write\n      contents: write\n"],
+  ['wf', 'the result is not published on a refusal', "        id: result\n        if: always()", "        id: result\n        if: steps.merge.outputs.merged == 'true'"],
 ];
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'merge-on-accept-mut-'));

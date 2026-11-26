@@ -121,13 +121,18 @@ jobs:
     environment:
       name: ${{ inputs.environment }}
       deployment: false
-    # The GITHUB_TOKEN reads, and writes only the FAIL or merged comment. It cannot merge or post a check.
+    # The GITHUB_TOKEN only reads. It cannot comment, merge or post a check; the report job comments.
     permissions:
       contents: read
-      issues: write
+      issues: read
       pull-requests: read
       checks: read
       statuses: read
+    outputs:
+      state: ${{ steps.result.outputs.state }}
+      reason: ${{ steps.result.outputs.reason }}
+      sha: ${{ steps.result.outputs.sha }}
+      method: ${{ steps.result.outputs.method }}
     steps:
       - name: Verify the pin
         id: pin
@@ -471,21 +476,49 @@ jobs:
             if (elsewhere.size) core.warning(`done-in-dev: issues in other repositories are left for their lead: ${[...elsewhere].join(', ')}`);
             // END done-in-dev
 
-      # Every outcome is said on the PR: merged, or FAIL <reason>. Read token plus issues: write.
-      - name: Report on the pull request
-        if: always() && github.event.issue.number
+      # The outcome leaves this job only as data, through job outputs, for the report job.
+      - name: Publish the result
+        id: result
+        if: always()
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
-            // BEGIN report
             const fs = require('fs');
             const path = require('path');
-            const file = path.join(process.env.RUNNER_TEMP, 'merge-result.json');
+            let r = null;
+            try { r = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'merge-result.json'), 'utf8')); } catch (error) { r = null; }
+            const sha = r && /^[0-9a-f]{40}$/.test(r.sha || '') ? r.sha : '';
+            core.setOutput('state', r && r.state === 'merged' && sha ? 'merged' : 'refused');
+            core.setOutput('reason', String((r && r.reason) || '').slice(0, 4000));
+            core.setOutput('sha', sha);
+            core.setOutput('method', r && ['squash', 'merge'].includes(r.method) ? r.method : '');
+
+  # Every outcome is said on the PR: merged, or FAIL <reason>. The only job whose GITHUB_TOKEN can write a
+  # pull request comment (pull-requests: write); it checks out nothing, reads no secret and runs only the
+  # inline script below, on the merge job's outputs as data.
+  report:
+    name: report on the pull request
+    needs: merge
+    if: always() && needs.merge.result != 'skipped'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Report on the pull request
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RESULT_STATE: ${{ needs.merge.outputs.state }}
+          RESULT_REASON: ${{ needs.merge.outputs.reason }}
+          RESULT_SHA: ${{ needs.merge.outputs.sha }}
+          RESULT_METHOD: ${{ needs.merge.outputs.method }}
+        with:
+          script: |
+            // BEGIN report
             const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-            let result = null;
-            try { result = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { result = null; }
-            const body = result && result.state === 'merged'
-              ? `Merged as ${result.sha} (${result.method}), \`review/independent\` posted by the Reviewer App. Run: ${run}`
-              : `FAIL ${(result && result.reason) || 'the merge job stopped before a verdict (the pin check or a step failed); nothing was merged.'} Run: ${run}`;
+            const sha = /^[0-9a-f]{40}$/.test(process.env.RESULT_SHA || '') ? process.env.RESULT_SHA : '';
+            const body = process.env.RESULT_STATE === 'merged' && sha
+              ? `Merged as ${sha} (${process.env.RESULT_METHOD || '?'}), \`review/independent\` posted by the Reviewer App. Run: ${run}`
+              : `FAIL ${process.env.RESULT_REASON || 'the merge job stopped before a verdict (the pin check or a step failed); nothing was merged.'} Run: ${run}`;
             await github.rest.issues.createComment({ ...context.repo, issue_number: context.payload.issue.number, body: body.slice(0, 60000) });
             // END report
