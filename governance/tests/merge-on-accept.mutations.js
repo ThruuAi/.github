@@ -44,6 +44,9 @@ const mutants = [
   ['wf', 'an expression in a script', "const temp = process.env.RUNNER_TEMP;\n            const v = JSON.parse(fs.readFileSync(path.join(temp, 'merge-verdict.json'), 'utf8'));\n            const { owner, repo } = context.repo;\n            try {",
     "const temp = process.env.RUNNER_TEMP;\n            const v = JSON.parse(fs.readFileSync(path.join(temp, 'merge-verdict.json'), 'utf8'));\n            const { owner, repo } = context.repo; const b = '${{ github.event.comment.body }}';\n            try {"],
   ['wf', 'the Reviewer token can write contents', "permission-checks: write\n\n      # Inline", "permission-checks: write\n          permission-contents: write\n\n      # Inline"],
+  ['wf', 'any App id is accepted', "if (process.env.AGENT_APP_ID !== '5075705' || process.env.REVIEWER_APP_ID !== '5075711')", 'if (false)'],
+  ['wf', 'the runner is not checked', "if (pattern && !new RegExp(pattern).test(process.env.RUNNER_NAME || ''))", 'if (false)'],
+  ['lib', 'a permission outage drops a CHANGES', "if (strict && !(error && error.status === 404)) throw error;", ''],
   ['wf', 'a refusal is not reported', "if: always() && github.event.issue.number", "if: steps.merge.outputs.merged == 'true'"],
 ];
 

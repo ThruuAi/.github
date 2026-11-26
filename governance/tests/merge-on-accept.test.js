@@ -58,7 +58,10 @@ ok('only workflow_call triggers it (never pull_request_target)', triggers.length
 ok('the job runs only for a new /merge comment on a pull request',
   /github\.event_name == 'issue_comment'/.test(job.if || '') && /github\.event\.action == 'created'/.test(job.if || '')
   && /github\.event\.issue\.pull_request/.test(job.if || '') && /startsWith\(github\.event\.comment\.body, '\/merge'\)/.test(job.if || ''));
-ok('the keys come from the merge-on-accept environment', job.environment && job.environment.name === 'merge-on-accept');
+ok('the keys come from the caller-named environment, default merge-apps',
+  job.environment && job.environment.name === '${{ inputs.environment }}' && ((doc.on || doc[true]).workflow_call.inputs.environment.default === 'merge-apps'));
+ok('both tokens are minted from the environment\'s App ids', (byName('Mint the Agent App token').with || {})['app-id'] === '${{ vars.AGENT_APP_ID }}'
+  && (byName('Mint the Reviewer App token').with || {})['app-id'] === '${{ vars.REVIEWER_APP_ID }}');
 const perms = job.permissions || {};
 ok('the GITHUB_TOKEN cannot write code, PRs or checks',
   perms.contents === 'read' && perms['pull-requests'] === 'read' && perms.checks === 'read' && perms.issues === 'write' && !('actions' in perms));
@@ -221,7 +224,8 @@ async function runJob(w, { cmd = command(H1), env = {}, keys = true } = {}) {
   const judged = await runStep('Judge the pull request', w, temp, base);
   let merged = null;
   if (judged.outputs.ok === 'true') {
-    const key = await runStep('Require the App keys', w, temp, keys ? { AGENT_PRIVATE_KEY: 'k', REVIEWER_PRIVATE_KEY: 'k' } : { AGENT_PRIVATE_KEY: '', REVIEWER_PRIVATE_KEY: '' });
+    const ids = { AGENT_APP_ID: '5075705', REVIEWER_APP_ID: '5075711', RUNNER_NAME: 'eph-ci-20261126010101-abcdef', RUNNER_NAME_PATTERN: '^eph-ci-[0-9]{14}-[0-9a-f]{6}$', ...(env.keyEnv || {}) };
+    const key = await runStep('Require the App keys', w, temp, keys ? { AGENT_PRIVATE_KEY: 'k', REVIEWER_PRIVATE_KEY: 'k', ...ids } : { AGENT_PRIVATE_KEY: '', REVIEWER_PRIVATE_KEY: '', ...ids });
     if (key.outputs.ready === 'true') {
       const review = await runStep('Post review/independent', w, temp);
       if (review.outputs.posted === 'true') {
@@ -371,6 +375,25 @@ async function runJob(w, { cmd = command(H1), env = {}, keys = true } = {}) {
     w.pr.head.sha = H2;
     const re = await runStep('Recheck before the merge', w, temp);
     ok('the recheck refuses a head that moved after the review was posted', re.outputs.ok !== 'true' && /head moved/.test((result(temp) || {}).reason || ''));
+  }
+  {
+    const w = world();
+    const r = await runJob(w, { env: { keyEnv: { AGENT_APP_ID: '999' } } });
+    ok('an environment naming another Agent App id refuses before any token', /must be 5075705/.test((r.result || {}).reason || '') && !w.calls.some((c) => c.name === 'check'));
+  }
+  {
+    const w = world();
+    const r = await runJob(w, { env: { keyEnv: { RUNNER_NAME: 'wsl-3' } } });
+    ok('a runner outside the runner-name-pattern refuses before any key is used', /does not match the runner-name-pattern/.test((r.result || {}).reason || '') && !w.calls.some((c) => c.name === 'check'));
+  }
+  {
+    const w = world();
+    w.comments.push({ id: 11, user: { login: 'flaky' }, body: `REVIEW CHANGES ${H1}`, html_url: 'u11' });
+    const g = fakeGithub(w);
+    const real = g.rest.repos.getCollaboratorPermissionLevel;
+    g.rest.repos.getCollaboratorPermissionLevel = async (a) => { if (a.username === 'flaky') throw httpError(502); return real(a); };
+    const v = await lib.judge({ github: g, owner: OWNER, repo: REPO, prNumber: 7, comment: command(H1), policy: { devMergeMethod: 'merge', staleGate: 'off' } });
+    ok('a permission lookup outage on a CHANGES author refuses instead of dropping it', refused(v, /cannot be weighed/));
   }
   {
     const w = world();

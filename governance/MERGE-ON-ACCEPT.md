@@ -29,14 +29,16 @@ its mutation proof.
   - come from someone with write access;
   - not be followed by `REVIEW CHANGES` for the same sha.
 - **A superseded check suite is not fixed automatically** (the 2240 lesson). It is refused with the fix: push an empty commit, then `/merge` the same reviewed sha.
+- **The runner is checked by name before any key is read** when the caller sets `runner-name-pattern` (thruu-sale: single-use `eph-ci-*` slots).
+- **A writer's `REVIEW CHANGES` posted during a "Base branch was modified" retry (up to about 80 s) is not re-read.** The PR state, head and base are.
 - **The ci-full mode of the stale-gate rule is not ported.** A ci-full PR is refused while the rule is on.
 - **`review/independent` can stay posted after a refusal.** It is posted before the final recheck. If the recheck then refuses (a `hold` label or a new `REVIEW CHANGES` in those seconds), the success check stays on that head. It reflects a real ACCEPT, but a writer could still merge from the UI; a new push clears it.
 - **Only writers' verdicts count.** A `REVIEW ACCEPT` or `REVIEW CHANGES` by someone without write access is ignored. A writer's `REVIEW CHANGES` posted while the merge is prepared stops it.
 - **A carried head must be an empty commit on the reviewed sha:** one parent, the reviewed sha, with the same tree.
 
 ## Adopting a repository (owner steps; secrets and settings are not set by agents)
-1. Create the environment `merge-on-accept` in the repository. Deployment branches: the default branch only (`dev` for thruu-sale).
-2. Add the environment secrets `AGENT_APP_PRIVATE_KEY` (marvinamiranda-agent, App 5075705) and `REVIEWER_APP_PRIVATE_KEY` (marvinamiranda-reviewer, App 5075711).
+1. Create the environment `merge-apps` (the caller's `environment` input) in the repository. Deployment branches: the default branch only (`dev` for thruu-sale).
+2. Add the environment secrets `AGENT_APP_PRIVATE_KEY` (marvinamiranda-agent) and `REVIEWER_APP_PRIVATE_KEY` (marvinamiranda-reviewer), and the environment variables `AGENT_APP_ID` = 5075705 and `REVIEWER_APP_ID` = 5075711. The job refuses any other ids.
 3. Optional repository variables:
    - `MERGE_STALE_GATE` (on/off);
    - `MERGE_RUNNER_JSON`. thruu-sale's default is its self-hosted light runner (`CI_LIGHT_RUNNER_JSON`), following the self-hosted-first rule. `["ubuntu-24.04"]` puts the keys only on a single-use hosted VM, at about a minute of hosted time per merge.

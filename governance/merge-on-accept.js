@@ -68,13 +68,16 @@ function closingRefs(body, owner, repo) {
   return [...out.values()];
 }
 
-async function hasWrite(github, owner, repo, login) {
+// true or false; with `strict`, an answer other than a role or a 404 throws, so a caller that must not read an
+// outage as "not a writer" (dropping a writer's CHANGES) can refuse instead.
+async function hasWrite(github, owner, repo, login, { strict = false } = {}) {
   if (typeof login !== 'string' || login.length === 0) return false;
   try {
     const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login });
     const role = (data && (data.role_name || data.permission)) || '';
     return WRITE_ROLES.has(String(role).toLowerCase());
   } catch (error) {
+    if (strict && !(error && error.status === 404)) throw error;
     return false;
   }
 }
@@ -271,7 +274,7 @@ async function latestVerdict(github, owner, repo, prNumber, sha, beforeId) {
   }
   const writers = new Map();
   const isWriter = async (login) => {
-    if (!writers.has(login)) writers.set(login, await hasWrite(github, owner, repo, login));
+    if (!writers.has(login)) writers.set(login, await hasWrite(github, owner, repo, login, { strict: true }));
     return writers.get(login);
   };
   const candidates = comments
@@ -280,7 +283,11 @@ async function latestVerdict(github, owner, repo, prNumber, sha, beforeId) {
     .filter((x) => x.v && x.v.sha === sha)
     .sort((a, b) => a.c.id - b.c.id);
   const counted = [];
-  for (const x of candidates) if (await isWriter(x.c.user && x.c.user.login)) counted.push(x);
+  try {
+    for (const x of candidates) if (await isWriter(x.c.user && x.c.user.login)) counted.push(x);
+  } catch (error) {
+    return { error: `Could not read a reviewer's permission (${httpStatus(error)}), so the verdicts cannot be weighed.` };
+  }
   return { last: counted.pop() || null };
 }
 

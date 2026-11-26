@@ -20,7 +20,9 @@
 # test), and, for a merge into dev, closes the issues the body closes and moves them on the Projects
 # (the old done-in-dev.sh).
 #
-# WHAT HOLDS THE KEYS. The job names the environment `merge-on-accept` of the CALLING repository. The
+# WHAT HOLDS THE KEYS. The job names the environment `inputs.environment` (default `merge-apps`) of the
+# CALLING repository. It holds the two App keys (secrets) and App ids (variables, checked against the fixed
+# ids 5075705 and 5075711). The
 # owner limits that environment to the default branch. An `issue_comment` job always runs the default
 # branch's copy of the caller, at the default branch's commit, so a pull request cannot edit the job
 # that receives the keys. The environment admits ANY job whose ref is the default branch, and it cannot
@@ -79,22 +81,26 @@ on:
         type: string
         required: false
         default: ''
-      agent-app-client-id:
-        description: Client id of the Agent App ("MarvinaMiranda Agent", App 5075705), which merges.
+      environment:
+        description: >-
+          The caller's environment that holds the App keys and ids (secrets AGENT_APP_PRIVATE_KEY and
+          REVIEWER_APP_PRIVATE_KEY, variables AGENT_APP_ID and REVIEWER_APP_ID), limited to the default branch.
         type: string
         required: false
-        default: Iv23liTb8XbgMKgvX50s
-      reviewer-app-client-id:
-        description: Client id of the Reviewer App ("MarvinaMiranda Reviewer", App 5075711), which posts review/independent.
+        default: merge-apps
+      runner-name-pattern:
+        description: >-
+          Regular expression the runner's name must match before any key is read (for example the single-use
+          slots of an ephemeral pool). Empty accepts any runner.
         type: string
         required: false
-        default: Iv23li6cVkJcIHkS8KYL
+        default: ''
     secrets:
       AGENT_APP_PRIVATE_KEY:
-        description: Forward this name explicitly; the merge-on-accept environment's value takes precedence. Never inherit.
+        description: Forward this name explicitly; the environment's value takes precedence. Never inherit.
         required: false
       REVIEWER_APP_PRIVATE_KEY:
-        description: Forward this name explicitly; the merge-on-accept environment's value takes precedence. Never inherit.
+        description: Forward this name explicitly; the environment's value takes precedence. Never inherit.
         required: false
 
 jobs:
@@ -113,7 +119,7 @@ jobs:
       group: merge-on-accept-${{ github.event.issue.number }}
       cancel-in-progress: false
     environment:
-      name: merge-on-accept
+      name: ${{ inputs.environment }}
       deployment: false
     # The GITHUB_TOKEN reads, and writes only the FAIL or merged comment. It cannot merge or post a check.
     permissions:
@@ -240,15 +246,30 @@ jobs:
         env:
           AGENT_PRIVATE_KEY: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
           REVIEWER_PRIVATE_KEY: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
+          AGENT_APP_ID: ${{ vars.AGENT_APP_ID }}
+          REVIEWER_APP_ID: ${{ vars.REVIEWER_APP_ID }}
+          RUNNER_NAME_PATTERN: ${{ inputs.runner-name-pattern }}
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const missing = ['AGENT_PRIVATE_KEY', 'REVIEWER_PRIVATE_KEY'].filter((k) => !(process.env[k] || '').trim());
-            if (missing.length) {
-              const reason = 'AGENT_APP_PRIVATE_KEY or REVIEWER_APP_PRIVATE_KEY is empty. Check the merge-on-accept environment and the explicit secret forwarding. Nothing was posted or merged.';
+            const refuse = (reason) => {
               fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'merge-result.json'), JSON.stringify({ state: 'refused', reason }));
               core.setFailed(reason);
+            };
+            // The keys go only to the runner the caller names (a single-use slot), checked by its name.
+            const pattern = process.env.RUNNER_NAME_PATTERN || '';
+            if (pattern && !new RegExp(pattern).test(process.env.RUNNER_NAME || '')) {
+              refuse(`The job runs on ${process.env.RUNNER_NAME || 'an unnamed runner'}, which does not match the runner-name-pattern. No key was read; nothing was posted or merged.`);
+              return;
+            }
+            if (['AGENT_PRIVATE_KEY', 'REVIEWER_PRIVATE_KEY'].some((k) => !(process.env[k] || '').trim())) {
+              refuse('AGENT_APP_PRIVATE_KEY or REVIEWER_APP_PRIVATE_KEY is empty. Check the environment and the explicit secret forwarding. Nothing was posted or merged.');
+              return;
+            }
+            // The two identities are fixed: a variable naming another App must not make it merge or review.
+            if (process.env.AGENT_APP_ID !== '5075705' || process.env.REVIEWER_APP_ID !== '5075711') {
+              refuse('The environment variables AGENT_APP_ID and REVIEWER_APP_ID must be 5075705 (MarvinaMiranda Agent) and 5075711 (MarvinaMiranda Reviewer). Nothing was posted or merged.');
               return;
             }
             core.setOutput('ready', 'true');
@@ -259,7 +280,7 @@ jobs:
         if: steps.key.outputs.ready == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ inputs.reviewer-app-client-id }}
+          app-id: ${{ vars.REVIEWER_APP_ID }}
           private-key: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
@@ -325,7 +346,7 @@ jobs:
         if: steps.recheck.outputs.ok == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ inputs.agent-app-client-id }}
+          app-id: ${{ vars.AGENT_APP_ID }}
           private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
