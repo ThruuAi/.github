@@ -369,6 +369,14 @@ jobs:
                 last = `HTTP ${status}: ${String((error && error.message) || '').slice(0, 400)}`;
                 if (status === 405 && /Base branch was modified/i.test(last) && !staleGateOn && attempt < 5) {
                   await new Promise((resolve) => setTimeout(resolve, wait));
+                  // Before each retry, the PR must still be the one judged: open, ready, same head and base, no hold.
+                  let pr;
+                  try { ({ data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: v.pr })); } catch (e) { pr = null; }
+                  const held = pr && (pr.labels || []).some((l) => String((l && l.name) || '').toLowerCase() === 'hold');
+                  if (!pr || pr.state !== 'open' || pr.draft || held || !pr.head || pr.head.sha !== v.headSha || !pr.base || pr.base.ref !== v.base) {
+                    last = `${last}; the PR changed while retrying (state, draft, hold, head or base)`;
+                    break;
+                  }
                   continue;
                 }
                 break;
@@ -401,7 +409,7 @@ jobs:
             const v = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'merge-verdict.json'), 'utf8'));
             if (v.base !== 'dev') return;
             const { owner, repo } = context.repo;
-            const re = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[: ]+((?:https:\/\/github\.com\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:#|\/issues\/)[0-9]+|#[0-9]+)/gi;
+            const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[: ]+((?:https:\/\/github\.com\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:#|\/issues\/)[0-9]+|#[0-9]+)/gi;
             const numbers = new Set();
             const elsewhere = new Set();
             for (const m of String(v.body || '').matchAll(re)) {
@@ -417,10 +425,14 @@ jobs:
               if (!Number.isSafeInteger(n) || n < 1) continue;
               try {
                 const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: n });
-                if (!issue || issue.state !== 'open' || issue.pull_request) continue;
-                await github.rest.issues.createComment({ owner, repo, issue_number: n,
-                  body: `Done in \`dev\` by ${owner}/${repo}#${v.pr}. It reaches \`test\` (tst) at the next dev→test promotion.` });
-                await github.rest.issues.update({ owner, repo, issue_number: n, state: 'closed', state_reason: 'completed' });
+                if (!issue || issue.pull_request) continue;
+                // dev is the default branch, so GitHub may already have closed it from this merge: still set its Status.
+                if (issue.state === 'closed' && issue.state_reason !== 'completed') continue;
+                if (issue.state === 'open') {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: n,
+                    body: `Done in \`dev\` by ${owner}/${repo}#${v.pr}. It reaches \`test\` (tst) at the next dev→test promotion.` });
+                  await github.rest.issues.update({ owner, repo, issue_number: n, state: 'closed', state_reason: 'completed' });
+                }
                 const data = await github.graphql(query, { o: owner, r: repo, n });
                 const nodes = (((data || {}).repository || {}).issue || {}).projectItems;
                 for (const item of (nodes && nodes.nodes) || []) {

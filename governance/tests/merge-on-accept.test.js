@@ -113,6 +113,7 @@ function world(over = {}) {
     pr: { number: 7, state: 'open', draft: false, merged: false, title: 'feat: x', body: 'Closes #3\nCloses ThruuAi/omni237#9',
       base: { ref: 'dev', repo: { id: 1 } }, head: { sha: H1, ref: 'feature/x', repo: { id: 1 } }, labels: [] },
     trees: { [H1]: 't1', [H2]: 't2', [H3]: 't1' },
+    parents: { [H3]: [H1], [H2]: [H1] },
     comments: [
       { id: 10, user: { login: 'reviewer' }, body: `REVIEW ACCEPT ${H1}\nLooks right.`, created_at: '2026-11-26T01:00:00Z', updated_at: '2026-11-26T01:00:00Z', html_url: 'u10' },
     ],
@@ -144,6 +145,7 @@ function fakeGithub(w) {
       get: async () => ({ data: JSON.parse(JSON.stringify(w.pr)) }),
       merge: async (args) => {
         rec('merge', args);
+        if (w.onMerge) { const f = w.onMerge; w.onMerge = null; f(); }
         const next = w.mergeAnswers.shift();
         if (next instanceof Error) throw next;
         if (args.sha !== w.pr.head.sha) throw httpError(409, 'Head branch was modified');
@@ -160,7 +162,7 @@ function fakeGithub(w) {
       getCommit: async ({ commit_sha: sha }) => {
         if (w.commits[sha]) return { data: w.commits[sha] };
         if (!w.trees[sha]) throw httpError(404);
-        return { data: { tree: { sha: w.trees[sha] } } };
+        return { data: { tree: { sha: w.trees[sha] }, parents: (w.parents[sha] || []).map((p) => ({ sha: p })) } };
       },
       getRef: async ({ ref }) => { if (!w.refs[ref]) throw httpError(404); return { data: { object: { sha: w.refs[ref] } } }; },
     },
@@ -301,7 +303,8 @@ async function runJob(w, { cmd = command(H1), env = {}, keys = true } = {}) {
     ['a fork', (w) => { w.pr.head.repo.id = 2; return [w]; }, /fork/],
     ['CHANGES after ACCEPT', (w) => { w.comments.push({ id: 11, user: { login: 'reviewer' }, body: `REVIEW CHANGES ${H1}`, html_url: 'u11' }); return [w]; }, /asks for changes/],
     ['an edited ACCEPT', (w) => { w.comments[0].updated_at = '2026-11-26T02:00:00Z'; return [w]; }, /edited/],
-    ['an ACCEPT by a reader', (w) => { w.comments[0].user.login = 'reader'; return [w]; }, /does not count/],
+    ['an ACCEPT by a reader', (w) => { w.comments[0].user.login = 'reader'; return [w]; }, /by someone with write access/],
+    ['a same-tree head on another parent', (w) => { w.pr.head.sha = H3; w.parents[H3] = [DEVH]; return [w]; }, /not an empty commit on top of it/],
     ['an ACCEPT posted after the command', (w) => { w.comments[0].id = 60; return [w]; }, /No `REVIEW ACCEPT/],
     ['a running check', (w) => { w.runs[H1] = [{ id: 1, name: 'build', status: 'in_progress', app: { slug: 'github-actions' } }]; return [w]; }, /still running/],
     ['a failed check', (w) => { w.runs[H1] = [{ id: 1, name: 'build', status: 'completed', conclusion: 'failure', app: { slug: 'github-actions' } }]; return [w]; }, /Checks failed.*build=failure/],
@@ -317,6 +320,21 @@ async function runJob(w, { cmd = command(H1), env = {}, keys = true } = {}) {
     const [w, cmd, policy] = setup(world());
     const v = await judge(w, cmd || command(H1), policy || { devMergeMethod: 'merge', staleGate: 'off' });
     ok(`refuses ${name}`, refused(v, re), JSON.stringify(v));
+  }
+  {
+    const w = world();
+    w.comments.push({ id: 11, user: { login: 'reader' }, body: `REVIEW CHANGES ${H1}`, html_url: 'u11' });
+    ok('a reader\'s CHANGES does not block a merge', (await judge(w)).ok === true);
+  }
+  {
+    const w = world();
+    const temp = tmp();
+    fs.writeFileSync(path.join(temp, 'merge-verdict.json'), JSON.stringify(await judge(w)));
+    fs.writeFileSync(path.join(temp, 'merge-policy.json'), JSON.stringify({ staleGate: 'off' }));
+    await runStep('Post review/independent', w, temp);
+    w.comments.push({ id: 70, user: { login: 'reviewer' }, body: `REVIEW CHANGES ${H1}\nfound a bug`, html_url: 'u70' });
+    const re = await runStep('Recheck before the merge', w, temp);
+    ok('the recheck refuses a writer\'s CHANGES posted after the judge', re.outputs.ok !== 'true' && /newer review/.test((result(temp) || {}).reason || ''));
   }
   {
     const w = world(); w.pr.head.sha = H3; // same tree as H1: an empty "re-run checks" commit
@@ -395,6 +413,29 @@ async function runJob(w, { cmd = command(H1), env = {}, keys = true } = {}) {
     const r2 = await runJob(g, { env: { STALE_GATE: 'on' } });
     ok('stale gate on: a base that moved during the merge refuses instead of retrying',
       r2.result.state === 'refused' && /stale-gate rule/.test(r2.result.reason) && g.calls.filter((c) => c.name === 'merge').length === 1);
+  }
+  {
+    const w = world();
+    const err = httpError(405, 'Base branch was modified.');
+    w.mergeAnswers = [err];
+    // A hold label lands between the first merge call and the retry.
+    w.onMerge = () => { w.pr.labels = [{ name: 'hold' }]; };
+    const r = await runJob(w);
+    ok('a retry after a base move refuses when the PR was put on hold meanwhile',
+      r.result.state === 'refused' && /changed while retrying/.test(r.result.reason) && w.calls.filter((c) => c.name === 'merge').length === 1);
+  }
+  {
+    const w = world();
+    w.issues[3] = { state: 'closed', state_reason: 'completed' };
+    await runJob(w);
+    ok('done in dev still sets the Project status of an issue GitHub already closed',
+      w.calls.some((c) => c.name === 'graphql' && c.args.oid === 'o-dev') && !w.calls.some((c) => c.name === 'update'));
+  }
+  {
+    const w = world();
+    w.pr.body = 'This leaves #3 unresolved #3 and prefixes #3';
+    await runJob(w);
+    ok('done in dev needs a whole closing word', !w.calls.some((c) => c.name === 'update' || c.name === 'graphql'));
   }
   {
     const w = world();

@@ -56,7 +56,7 @@ function parseVerdict(body) {
 
 // "Closes #12", "Fixes owner/repo#12", "Resolves https://github.com/owner/repo/issues/12" (the done-in-dev.sh grammar).
 function closingRefs(body, owner, repo) {
-  const re = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[: ]+((?:https:\/\/github\.com\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:#|\/issues\/)[0-9]+|#[0-9]+)/gi;
+  const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[: ]+((?:https:\/\/github\.com\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:#|\/issues\/)[0-9]+|#[0-9]+)/gi;
   const out = new Map();
   for (const m of String(body || '').matchAll(re)) {
     const ref = m[1].replace(/^https:\/\/github\.com\//i, '').replace('/issues/', '#');
@@ -251,13 +251,37 @@ async function readPr(github, owner, repo, number) {
   }
 }
 
-async function treeOf(github, owner, repo, sha) {
+async function commitOf(github, owner, repo, sha) {
   try {
     const { data } = await github.rest.git.getCommit({ owner, repo, commit_sha: sha });
-    return data && data.tree && data.tree.sha;
+    return data && data.tree && data.tree.sha ? data : null;
   } catch (error) {
     return null;
   }
+}
+
+// The latest review verdict for `sha` among the comments posted before `beforeId`, by authors with write access
+// only (a reader cannot block a merge with a CHANGES comment, nor approve one with an ACCEPT).
+async function latestVerdict(github, owner, repo, prNumber, sha, beforeId) {
+  let comments;
+  try {
+    comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
+  } catch (error) {
+    return { error: `Could not read the comments of #${prNumber} (${httpStatus(error)}).` };
+  }
+  const writers = new Map();
+  const isWriter = async (login) => {
+    if (!writers.has(login)) writers.set(login, await hasWrite(github, owner, repo, login));
+    return writers.get(login);
+  };
+  const candidates = comments
+    .filter((c) => c && Number.isSafeInteger(c.id) && c.id < beforeId)
+    .map((c) => ({ c, v: parseVerdict(c.body) }))
+    .filter((x) => x.v && x.v.sha === sha)
+    .sort((a, b) => a.c.id - b.c.id);
+  const counted = [];
+  for (const x of candidates) if (await isWriter(x.c.user && x.c.user.login)) counted.push(x);
+  return { last: counted.pop() || null };
 }
 
 function mergeMethod(base, policy) {
@@ -282,33 +306,31 @@ async function judge({ github, owner, repo, prNumber, comment, policy = {} }) {
   const method = mergeMethod(pr.base.ref, policy);
   if (!method) return fail(`The dev merge method '${policy.devMergeMethod}' is not squash or merge.`);
 
-  // The head must be the sha named, or a commit with the same tree (an empty "re-run checks" commit).
+  // The head must be the sha named, or an empty "re-run checks" commit on top of it: one parent, the reviewed
+  // sha, and the same tree. A same-tree commit on another parent (a newer base) could still drop the base's
+  // changes when merged, so it is not carried.
   const head = pr.head.sha;
   let carried = false;
   if (head !== sha) {
-    const [treeHead, treeSha] = await Promise.all([treeOf(github, owner, repo, head), treeOf(github, owner, repo, sha)]);
-    if (!treeHead || !treeSha) return fail(`Could not read the trees of ${head.slice(0, 8)} and ${sha.slice(0, 8)}.`);
-    if (treeHead !== treeSha) return fail(`The head moved to ${head.slice(0, 8)} since ${sha.slice(0, 8)}, and its tree differs. Review the new head, then comment /merge <new sha>.`);
+    const [cHead, cSha] = await Promise.all([commitOf(github, owner, repo, head), commitOf(github, owner, repo, sha)]);
+    if (!cHead || !cSha) return fail(`Could not read the commits ${head.slice(0, 8)} and ${sha.slice(0, 8)}.`);
+    const parents = (cHead.parents || []).map((p) => p && p.sha);
+    if (cHead.tree.sha !== cSha.tree.sha || parents.length !== 1 || parents[0] !== sha) {
+      return fail(`The head moved to ${head.slice(0, 8)} since ${sha.slice(0, 8)}, and it is not an empty commit on top of it. Review the new head, then comment /merge <new sha>.`);
+    }
     carried = true;
   }
 
-  // The accepting review: an unedited comment `REVIEW ACCEPT <sha>`, posted before this command by someone with
-  // write access, and not followed by a `REVIEW CHANGES <sha>`.
-  let comments;
-  try {
-    comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
-  } catch (error) {
-    return fail(`Could not read the comments of #${prNumber} (${httpStatus(error)}).`);
-  }
-  const before = (c) => c && Number.isSafeInteger(c.id) && c.id < comment.id;
-  const verdicts = comments.filter(before).map((c) => ({ c, v: parseVerdict(c.body) })).filter((x) => x.v && x.v.sha === sha);
-  const lastVerdict = verdicts.slice().sort((a, b) => a.c.id - b.c.id).pop();
-  if (!lastVerdict) return fail(`No \`REVIEW ACCEPT ${sha}\` comment was posted before this command.`);
+  // The accepting review: the latest verdict for this sha by a writer, posted before this command, is an
+  // unedited comment `REVIEW ACCEPT <sha>`.
+  const lv = await latestVerdict(github, owner, repo, prNumber, sha, comment.id);
+  if (lv.error) return fail(lv.error);
+  const lastVerdict = lv.last;
+  if (!lastVerdict) return fail(`No \`REVIEW ACCEPT ${sha}\` comment by someone with write access was posted before this command.`);
   if (lastVerdict.v.verdict !== 'ACCEPT') return fail(`The latest review of ${sha.slice(0, 8)} asks for changes (${lastVerdict.c.html_url || 'comment'}).`);
   const accept = lastVerdict.c;
   if (accept.updated_at && accept.created_at && accept.updated_at !== accept.created_at) return fail(`The ACCEPT comment was edited after it was posted (${accept.html_url || 'comment'}); post a new one.`);
   const reviewer = accept.user && accept.user.login;
-  if (!(await hasWrite(github, owner, repo, reviewer))) return fail(`The ACCEPT comment's author ${reviewer || '?'} does not have write access, so it does not count.`);
 
   const checks = await checksProblem(github, owner, repo, pr, head, policy, { includeReview: false });
   if (checks) return fail(checks);
@@ -317,7 +339,8 @@ async function judge({ github, owner, repo, prNumber, comment, policy = {} }) {
     + (carried ? ` Carried to ${head.slice(0, 8)}: same tree as reviewed ${sha.slice(0, 8)}.` : ''));
   return {
     ok: true, pr: pr.number, base: pr.base.ref, headSha: head, reviewedSha: sha, carried, method,
-    title: pr.title, body: pr.body || '', reviewer, commander: login, acceptUrl: accept.html_url || '', summary,
+    title: pr.title, body: pr.body || '', reviewer, commander: login, acceptUrl: accept.html_url || '', acceptId: accept.id,
+    commandId: comment.id, summary,
   };
 }
 
@@ -329,6 +352,10 @@ async function recheck({ github, owner, repo, verdict, policy = {} }) {
   if (problem) return problem;
   if (pr.head.sha !== verdict.headSha) return `The head moved from ${verdict.headSha.slice(0, 8)} to ${pr.head.sha.slice(0, 8)} while the merge was prepared.`;
   if (pr.base.ref !== verdict.base) return `The base changed from ${verdict.base} to ${pr.base.ref} while the merge was prepared.`;
+  // A writer's REVIEW CHANGES posted since the judge (any time before now) stops the merge.
+  const lv = await latestVerdict(github, owner, repo, verdict.pr, verdict.reviewedSha, Number.MAX_SAFE_INTEGER);
+  if (lv.error) return lv.error;
+  if (!lv.last || lv.last.v.verdict !== 'ACCEPT' || lv.last.c.id !== verdict.acceptId) return `A newer review of ${verdict.reviewedSha.slice(0, 8)} was posted while the merge was prepared.`;
   return checksProblem(github, owner, repo, pr, verdict.headSha, policy, { includeReview: true });
 }
 
