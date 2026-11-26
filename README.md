@@ -23,6 +23,7 @@ holds `workflows: write`.
 | Reusable PR governance workflow (`governance/issue-link`, areas check) | `.github/workflows/pr-governance.yml` |
 | Reusable source-policy workflow (`test-source-policy`, `main-source-policy`) | `.github/workflows/source-policy.yml` |
 | Reusable workflow that publishes `governance/issue-link` as the Checks App, from a caller's `workflow_run` job | `.github/workflows/issue-link-publish.yml` |
+| Reusable `/merge <sha>` workflow: posts `review/independent` as the Reviewer App and merges as the Agent App (replaces merge-pr.sh), its judge and tests | `.github/workflows/merge-on-accept.yml`, `governance/merge-on-accept.js`, `governance/MERGE-ON-ACCEPT.md` |
 | Issue-link matcher and its tests | `governance/issue-link.js`, `governance/tests/issue-link.test.js` |
 | Source-policy matcher and its tests | `governance/source-policy.js`, `governance/tests/source-policy.test.js` |
 | Areas checker and its tests | `governance/areas-check.js`, `governance/tests/areas-check.test.js` |

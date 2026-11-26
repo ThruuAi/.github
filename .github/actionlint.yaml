@@ -2,7 +2,7 @@
 # GitHub added on 2026-09-03 ("GitHub Actions: Early September 2026 updates";
 # docs: Contexts reference, `job` context). pr-governance.yml reads two of
 # them to learn which commit of itself is running, and so do
-# issue-link-publish.yml and source-policy.yml. Only those three files, and only on
+# issue-link-publish.yml, source-policy.yml and merge-on-accept.yml. Only those four files, and only on
 # the `job` context's own object type (the same text on `needs.<job>.outputs`
 # would still be reported). Delete this file once
 # actionlint knows the properties.
@@ -14,5 +14,8 @@ paths:
     ignore:
       - 'property "workflow_(sha|repository)" is not defined in object type \{check_run_id: number; container: '
   .github/workflows/source-policy.yml:
+    ignore:
+      - 'property "workflow_(sha|repository)" is not defined in object type \{check_run_id: number; container: '
+  .github/workflows/merge-on-accept.yml:
     ignore:
       - 'property "workflow_(sha|repository)" is not defined in object type \{check_run_id: number; container: '
