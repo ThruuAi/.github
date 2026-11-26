@@ -46,6 +46,8 @@ const doc = load(WORKFLOW);
 const publish = load(PUBLISH);
 const lib = require(LIB);
 const job = (doc.jobs && doc.jobs.merge) || {};
+const reportJob = (doc.jobs && doc.jobs.report) || {};
+const reportStep = ((reportJob.steps || [])[0]) || {};
 const steps = job.steps || [];
 const script = (s) => (s && s.with && typeof s.with.script === 'string' ? s.with.script : '');
 const byName = (name) => steps.find((s) => s.name === name) || {};
@@ -64,7 +66,20 @@ ok('both tokens are minted from the environment\'s App ids', (byName('Mint the A
   && (byName('Mint the Reviewer App token').with || {})['app-id'] === '${{ vars.REVIEWER_APP_ID }}');
 const perms = job.permissions || {};
 ok('the GITHUB_TOKEN cannot write code, PRs or checks',
-  perms.contents === 'read' && perms['pull-requests'] === 'read' && perms.checks === 'read' && perms.issues === 'write' && !('actions' in perms));
+  perms.contents === 'read' && perms['pull-requests'] === 'read' && perms.checks === 'read' && perms.issues === 'read'
+  && Object.values(perms).every((v) => v === 'read'));
+ok('only the report job can comment: pull-requests: write and nothing else',
+  JSON.stringify(reportJob.permissions) === JSON.stringify({ 'pull-requests': 'write' }));
+ok('the report job needs the merge job and runs on every outcome but a skip',
+  reportJob.needs === 'merge' && String(reportJob.if || '') === "always() && needs.merge.result != 'skipped'");
+ok('the report job has one inline step: no checkout, no secret, no environment, no run:',
+  (reportJob.steps || []).length === 1 && String(reportStep.uses || '').startsWith('actions/github-script@')
+  && !JSON.stringify(reportJob).includes('secrets.') && !('environment' in reportJob) && !('run' in reportStep)
+  && !script(reportStep).includes('${{') && !(reportStep.with && reportStep.with['github-token']));
+ok('the result reaches the report job only through job outputs, as env',
+  JSON.stringify(job.outputs) === JSON.stringify({ state: '${{ steps.result.outputs.state }}', reason: '${{ steps.result.outputs.reason }}',
+    sha: '${{ steps.result.outputs.sha }}', method: '${{ steps.result.outputs.method }}' })
+  && (reportStep.env || {}).RESULT_REASON === '${{ needs.merge.outputs.reason }}');
 ok('no step has a run: key', steps.every((s) => !('run' in s)));
 ok('no ${{ }} expression inside any script', steps.every((s) => !script(s).includes('${{')));
 const checkouts = steps.filter((s) => String(s.uses || '').startsWith('actions/checkout@'));
@@ -75,7 +90,7 @@ const pinBlock = (text) => { const m = /\/\/ BEGIN verify-pin[^\n]*\n([\s\S]*?)\
 const publishPin = pinBlock(script(publish.jobs.publish.steps.find((s) => s.name === 'Verify the pin')));
 ok('the first step is the verify-pin check, the same text as issue-link-publish.yml',
   steps[0] && steps[0].name === 'Verify the pin' && publishPin && pinBlock(script(steps[0])) === publishPin);
-ok('every later step needs the pin', steps.slice(1).every((s) => /steps\.(pin|judge|key|review|recheck|merge)\.outputs\./.test(String(s.if || '')) || s.name === 'Report on the pull request'));
+ok('every later step needs the pin', steps.slice(1).every((s) => /steps\.(pin|judge|key|review|recheck|merge)\.outputs\./.test(String(s.if || '')) || s.name === 'Publish the result'));
 const usesSecret = (s) => JSON.stringify(s).includes('secrets.');
 ok('only the key check and the two mint steps read a secret',
   steps.filter(usesSecret).map((s) => s.name).join('|') === 'Require the App keys|Mint the Reviewer App token|Mint the Agent App token');
@@ -94,8 +109,8 @@ ok('the Agent token is this repository only', agent.repositories === '${{ github
 ok('the review is posted with the Reviewer token, the merge with the Agent token',
   (byName('Post review/independent').with || {})['github-token'] === '${{ steps.reviewer-app.outputs.token }}'
   && (byName('Merge as the Agent App').with || {})['github-token'] === '${{ steps.agent-app.outputs.token }}');
-ok('the report runs on every outcome, last', /^always\(\)/.test(String(byName('Report on the pull request').if || ''))
-  && indexOf('Report on the pull request') === steps.length - 1);
+ok('the result is published on every outcome, last', String(byName('Publish the result').if || '') === 'always()'
+  && indexOf('Publish the result') === steps.length - 1);
 ok('every action is pinned to a full sha', steps.every((s) => !s.uses || /@[0-9a-f]{40}$/.test(String(s.uses).split(' ')[0])));
 
 // ---------------------------------------------------------------- fake API --------------------------------------------
@@ -207,7 +222,8 @@ async function runStep(name, w, temp, env = {}) {
   const context = { repo: { owner: OWNER, repo: REPO }, payload: { issue: { number: 7 }, comment: env.__comment || command(H1) } };
   const req = (m) => (m === './.org-governance/governance/merge-on-accept.js' ? lib : require(m));
   try {
-    await new AsyncFunction('github', 'context', 'core', 'require', script(byName(name)))(fakeGithub(w), context, core, req);
+    const step = name === 'Report on the pull request' ? reportStep : byName(name);
+    await new AsyncFunction('github', 'context', 'core', 'require', script(step))(fakeGithub(w), context, core, req);
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
@@ -237,7 +253,9 @@ async function runJob(w, { cmd = command(H1), env = {}, keys = true } = {}) {
       }
     }
   }
-  await runStep('Report on the pull request', w, temp);
+  const out = (await runStep('Publish the result', w, temp)).outputs;
+  await runStep('Report on the pull request', w, temp,
+    { RESULT_STATE: out.state || '', RESULT_REASON: out.reason || '', RESULT_SHA: out.sha || '', RESULT_METHOD: out.method || '' });
   const reports = w.calls.filter((c) => c.name === 'comment' && c.args.issue_number === 7).map((c) => c.args.body);
   return { temp, result: result(temp), report: reports[reports.length - 1] || '', merged };
 }
@@ -475,7 +493,9 @@ async function runJob(w, { cmd = command(H1), env = {}, keys = true } = {}) {
   {
     const w = world();
     const temp = tmp();
-    await runStep('Report on the pull request', w, temp);
+    const out = (await runStep('Publish the result', w, temp)).outputs;
+    ok('no result file publishes a refusal with no reason', out.state === 'refused' && out.reason === '' && out.sha === '');
+    await runStep('Report on the pull request', w, temp, { RESULT_STATE: '', RESULT_REASON: '', RESULT_SHA: '', RESULT_METHOD: '' });
     const body = (w.calls.find((c) => c.name === 'comment') || { args: {} }).args.body || '';
     ok('a job that stopped before a verdict still says FAIL on the PR', body.startsWith('FAIL the merge job stopped before a verdict'));
   }

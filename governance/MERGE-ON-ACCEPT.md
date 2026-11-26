@@ -42,7 +42,8 @@ its mutation proof.
 3. Optional repository variables:
    - `MERGE_STALE_GATE` (on/off);
    - `MERGE_RUNNER_JSON`. thruu-sale's default is its self-hosted light runner (`CI_LIGHT_RUNNER_JSON`), following the self-hosted-first rule. `["ubuntu-24.04"]` puts the keys only on a single-use hosted VM, at about a minute of hosted time per merge.
-4. Merge the caller `.github/workflows/merge-on-accept.yml` into the default branch, pinned twice (`uses:` and `governance-ref`) to a merged commit of this repository's `test`.
+4. The caller's top-level `permissions` grant `contents: read`, `issues: read`, `pull-requests: write`, `checks: read` and `statuses: read`. Only the separate `report` job uses `pull-requests: write`: it posts the `Merged`/`FAIL` comment from the merge job's outputs. A pull request comment needs `pull-requests: write`; `issues: write` alone gets a 403, which the first live run (thruu-sale run 45777638566) showed.
+5. Merge the caller `.github/workflows/merge-on-accept.yml` into the default branch, pinned twice (`uses:` and `governance-ref`) to a merged commit of this repository's `test`.
 
 ## Open question for the owner: the #849 stale-gate rule on dev
 The rule refuses a merge unless the newest green `gate` check tested the merge ref built on the current dev head. It is ported here behind the caller's `stale-gate` input. thruu-sale reads it from the repository variable `MERGE_STALE_GATE`, so switching it needs no code change.
