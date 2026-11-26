@@ -1,0 +1,458 @@
+# Merges a reviewed pull request when its repo lead comments `/merge <sha>` (ThruuAi/.github#22).
+# It replaces the Mac-only ~/repo/_handover/merge-pr.sh for cloud leads: the same checks, the same two
+# identities (the Reviewer App posts `review/independent`, the Agent App merges), with both App keys
+# held only in an Actions environment of the adopting repository.
+#
+# THE FLOW. (1) The independent reviewer comments `REVIEW ACCEPT <40-char sha>` (or `REVIEW CHANGES
+# <sha>`) on the PR, followed by its summary. (2) The lead comments `/merge <sha>`. (3) This job judges
+# the PR. Everything must hold, or nothing is posted and the PR gets a `FAIL <reason>` comment:
+#   * the commenter has write, maintain or admin permission;
+#   * the latest verdict for that sha, posted before the command, is an unedited `REVIEW ACCEPT <sha>`
+#     comment whose author has write permission;
+#   * the head is that sha, or a commit with the same tree (an empty "re-run checks" commit, as merge-pr.sh
+#     allows);
+#   * the base is dev or test (never main or uat), the PR is open, not a draft, not from a fork and has no
+#     `hold` label;
+#   * every required check of the base's rulesets (with its App pin) is success, no other check is running
+#     or failed, no commit status failed, and the #849 stale-gate rule holds when the caller turns it on.
+# Then it posts `review/independent` = success as the Reviewer App, re-judges the live PR, merges as the
+# Agent App with `sha=<head>` (squash or merge into dev, as the caller says; always a merge commit into
+# test), and, for a merge into dev, closes the issues the body closes and moves them on the Projects
+# (the old done-in-dev.sh).
+#
+# WHAT HOLDS THE KEYS. The job names the environment `merge-on-accept` of the CALLING repository. The
+# owner limits that environment to the default branch. An `issue_comment` job always runs the default
+# branch's copy of the caller, at the default branch's commit, so a pull request cannot edit the job
+# that receives the keys. The environment admits ANY job whose ref is the default branch, and it cannot
+# stop such a job running pull request code. So this job must never check out, build, run or evaluate
+# anything a pull request supplies:
+#   * the only checkout is of ThruuAi/.github at governance-ref, which the first step proved is a
+#     merged commit of `test`;
+#   * no `run:` step, and no `${{ }}` expression inside any script: the comment, the PR and the verdict
+#     reach scripts through env, the event payload or a JSON file, as DATA;
+#   * the judge (fetched, pinned code) holds only the read GITHUB_TOKEN. The App keys and App tokens are
+#     seen only by inline scripts of this file, and they act only on the judge's JSON verdict.
+# governance/tests/merge-on-accept.test.js pins every one of these.
+#
+# NOT DONE HERE, by design: main and uat (owner only), release tags, packages, rulesets; the owner's
+# code-owner bypass of merge-pr.sh (it uses the owner's own login; this job refuses and says so); the
+# ci-full mode of the stale-gate rule (refused, so it fails closed).
+#
+# Runs where the caller says (no default). A single-use VM (GitHub-hosted, or an ephemeral self-hosted
+# one) keeps the App keys off long-lived runners; a merge takes about a minute.
+name: Merge on accept
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner for the job, as JSON (a label string or a list of labels). No default.
+        type: string
+        required: true
+      governance-ref:
+        description: >-
+          Commit SHA of ThruuAi/.github whose governance/merge-on-accept.js is used -- the same SHA the
+          caller pins this workflow to, and on its test branch.
+        type: string
+        required: true
+      dev-merge-method:
+        description: squash or merge, for a PR into dev. A PR into test is always merged with a merge commit.
+        type: string
+        required: false
+        default: squash
+      stale-gate:
+        description: >-
+          on or off: the #849 rule (the newest successful gate tested the merge ref built on the current
+          base head). Anything else refuses. Pass a repository variable so it switches without a code change.
+        type: string
+        required: false
+        default: 'on'
+      gate-check:
+        description: The check name the stale-gate rule reads.
+        type: string
+        required: false
+        default: gate
+      required-checks:
+        description: >-
+          Extra required check names, one per line, added to the base's rulesets (for a branch with no
+          ruleset). Empty by default.
+        type: string
+        required: false
+        default: ''
+      agent-app-client-id:
+        description: Client id of the Agent App ("MarvinaMiranda Agent", App 5075705), which merges.
+        type: string
+        required: false
+        default: Iv23liTb8XbgMKgvX50s
+      reviewer-app-client-id:
+        description: Client id of the Reviewer App ("MarvinaMiranda Reviewer", App 5075711), which posts review/independent.
+        type: string
+        required: false
+        default: Iv23li6cVkJcIHkS8KYL
+    secrets:
+      AGENT_APP_PRIVATE_KEY:
+        description: Forward this name explicitly; the merge-on-accept environment's value takes precedence. Never inherit.
+        required: false
+      REVIEWER_APP_PRIVATE_KEY:
+        description: Forward this name explicitly; the merge-on-accept environment's value takes precedence. Never inherit.
+        required: false
+
+jobs:
+  merge:
+    name: merge on accept
+    # Only a new comment on a pull request whose text starts with /merge. Anything else skips the job, so
+    # no token is minted and no key is read.
+    if: >-
+      github.event_name == 'issue_comment' && github.event.action == 'created'
+      && github.event.issue.pull_request && startsWith(github.event.comment.body, '/merge')
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    # One command per pull request at a time. Merges of different PRs run side by side; GitHub's
+    # "Base branch was modified" answer to the second one is retried below.
+    concurrency:
+      group: merge-on-accept-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    environment:
+      name: merge-on-accept
+      deployment: false
+    # The GITHUB_TOKEN reads, and writes only the FAIL or merged comment. It cannot merge or post a check.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      checks: read
+      statuses: read
+    steps:
+      - name: Verify the pin
+        id: pin
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SELF_SHA: ${{ job.workflow_sha }}
+          SELF_REPOSITORY: ${{ job.workflow_repository }}
+          GOVERNANCE_REF: ${{ inputs.governance-ref }}
+        with:
+          script: |
+            // BEGIN verify-pin: the same in both jobs; governance/tests/pr-governance.test.js runs it.
+            async function verifyPin({ github, env }) {
+              const self = env.SELF_SHA || '';
+              const ref = env.GOVERNANCE_REF || '';
+              if ((env.SELF_REPOSITORY || '').toLowerCase() !== 'thruuai/.github') {
+                return `This workflow is running from ${env.SELF_REPOSITORY || 'an unknown repository'}, not ThruuAi/.github.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(self)) {
+                return 'GitHub did not report the commit this workflow runs from (job.workflow_sha), so the pin cannot be checked.';
+              }
+              if (ref !== self) {
+                return `governance-ref is "${ref}", but uses: pins ${self}. Set both to the same merged commit of ThruuAi/.github.`;
+              }
+              // test is read as a branch, then compared by its sha: the bare
+              // name "test" in a compare could resolve to a tag of that name.
+              let tip;
+              try {
+                const { data: branch } = await github.rest.repos.getBranch({ owner: 'ThruuAi', repo: '.github', branch: 'test' });
+                tip = branch && branch.commit && branch.commit.sha;
+              } catch (error) {
+                return `Could not read ThruuAi/.github test (HTTP ${error.status || '?'}), so the pin cannot be checked.`;
+              }
+              if (!/^[0-9a-f]{40}$/.test(tip || '')) {
+                return 'GitHub returned no commit for ThruuAi/.github test, so the pin cannot be checked.';
+              }
+              let status;
+              try {
+                ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: 'ThruuAi', repo: '.github', basehead: `${tip}...${self}`, per_page: 1 }));
+              } catch (error) {
+                return `Could not compare ${self} with ThruuAi/.github test (HTTP ${error.status || '?'}).`;
+              }
+              if (status !== 'identical' && status !== 'behind') {
+                return `${self} is not on ThruuAi/.github test (GitHub compares it as "${status}"). Pin a merged commit of test, never a pull request branch or a fork.`;
+              }
+              return '';
+            }
+            // END verify-pin
+            const problem = await verifyPin({ github, env: process.env });
+            core.setOutput('ok', problem ? 'false' : 'true');
+            if (problem) {
+              // Nothing is posted and no token is minted: the job fails, and the
+              // reason is in its summary.
+              await core.summary.addHeading('Not merged: the pin check failed').addRaw(problem).write();
+              core.setFailed(problem);
+            }
+
+      - name: Fetch the judge
+        if: steps.pin.outputs.ok == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ThruuAi/.github
+          ref: ${{ inputs.governance-ref }}
+          path: .org-governance
+          sparse-checkout: governance/merge-on-accept.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Holds only the read GITHUB_TOKEN. Writes the verdict to a file; posts nothing.
+      - name: Judge the pull request
+        id: judge
+        if: steps.pin.outputs.ok == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          DEV_MERGE_METHOD: ${{ inputs.dev-merge-method }}
+          STALE_GATE: ${{ inputs.stale-gate }}
+          GATE_CHECK: ${{ inputs.gate-check }}
+          REQUIRED_CHECKS: ${{ inputs.required-checks }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const lib = require('./.org-governance/governance/merge-on-accept.js');
+            const temp = process.env.RUNNER_TEMP;
+            const policy = {
+              devMergeMethod: process.env.DEV_MERGE_METHOD,
+              staleGate: process.env.STALE_GATE,
+              gateCheck: process.env.GATE_CHECK,
+              requiredChecks: String(process.env.REQUIRED_CHECKS || '').split('\n').map((s) => s.trim()).filter(Boolean),
+            };
+            fs.writeFileSync(path.join(temp, 'merge-policy.json'), JSON.stringify(policy));
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue || {};
+            let verdict;
+            try {
+              verdict = await lib.judge({ github, owner, repo, prNumber: issue.number, comment: context.payload.comment, policy });
+            } catch (error) {
+              const status = error && Number.isInteger(error.status) ? `HTTP ${error.status}` : 'an error';
+              verdict = { ok: false, reason: `The judge could not run (${status}). Nothing was posted or merged; comment /merge again.` };
+            }
+            if (!verdict || verdict.ok !== true) {
+              const reason = (verdict && verdict.reason) || 'The judge returned no verdict.';
+              fs.writeFileSync(path.join(temp, 'merge-result.json'), JSON.stringify({ state: 'refused', reason }));
+              await core.summary.addHeading('Not merged').addRaw(reason).write();
+              core.setFailed(reason);
+              return;
+            }
+            fs.writeFileSync(path.join(temp, 'merge-verdict.json'), JSON.stringify(verdict));
+            core.setOutput('ok', 'true');
+
+      # After fetched code has finished. Reveals presence only, never a key.
+      - name: Require the App keys
+        id: key
+        if: steps.pin.outputs.ok == 'true' && steps.judge.outputs.ok == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          AGENT_PRIVATE_KEY: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+          REVIEWER_PRIVATE_KEY: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const missing = ['AGENT_PRIVATE_KEY', 'REVIEWER_PRIVATE_KEY'].filter((k) => !(process.env[k] || '').trim());
+            if (missing.length) {
+              const reason = 'AGENT_APP_PRIVATE_KEY or REVIEWER_APP_PRIVATE_KEY is empty. Check the merge-on-accept environment and the explicit secret forwarding. Nothing was posted or merged.';
+              fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'merge-result.json'), JSON.stringify({ state: 'refused', reason }));
+              core.setFailed(reason);
+              return;
+            }
+            core.setOutput('ready', 'true');
+
+      # This repository only, `checks: write` only.
+      - name: Mint the Reviewer App token
+        id: reviewer-app
+        if: steps.key.outputs.ready == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.reviewer-app-client-id }}
+          private-key: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+
+      # Inline text only: it reads the verdict as JSON data.
+      - name: Post review/independent
+        id: review
+        if: steps.key.outputs.ready == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ steps.reviewer-app.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const temp = process.env.RUNNER_TEMP;
+            const v = JSON.parse(fs.readFileSync(path.join(temp, 'merge-verdict.json'), 'utf8'));
+            const { owner, repo } = context.repo;
+            try {
+              const { data } = await github.rest.checks.create({
+                owner, repo, name: 'review/independent', head_sha: v.headSha, status: 'completed', conclusion: 'success',
+                output: { title: 'Independent review: success', summary: String(v.summary).slice(0, 60000) },
+              });
+              if (!data || data.head_sha !== v.headSha || data.conclusion !== 'success') throw Object.assign(new Error('unexpected answer'), { status: 0 });
+              core.setOutput('posted', 'true');
+            } catch (error) {
+              const reason = `Could not post review/independent as the Reviewer App (HTTP ${(error && error.status) || '?'}). Nothing was merged.`;
+              fs.writeFileSync(path.join(temp, 'merge-result.json'), JSON.stringify({ state: 'refused', reason }));
+              core.setFailed(reason);
+            }
+
+      # The judge again, on the live PR, now counting review/independent. Read token only.
+      - name: Recheck before the merge
+        id: recheck
+        if: steps.review.outputs.posted == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const lib = require('./.org-governance/governance/merge-on-accept.js');
+            const temp = process.env.RUNNER_TEMP;
+            const verdict = JSON.parse(fs.readFileSync(path.join(temp, 'merge-verdict.json'), 'utf8'));
+            const policy = JSON.parse(fs.readFileSync(path.join(temp, 'merge-policy.json'), 'utf8'));
+            const { owner, repo } = context.repo;
+            let problem;
+            try {
+              problem = await lib.recheck({ github, owner, repo, verdict, policy });
+            } catch (error) {
+              problem = `The recheck could not run (HTTP ${(error && error.status) || '?'}).`;
+            }
+            if (problem) {
+              const reason = `${problem} Nothing was merged.`;
+              fs.writeFileSync(path.join(temp, 'merge-result.json'), JSON.stringify({ state: 'refused', reason }));
+              core.setFailed(reason);
+              return;
+            }
+            core.setOutput('ok', 'true');
+
+      # This repository only. organization_projects for the Project Status update after a merge into dev.
+      - name: Mint the Agent App token
+        id: agent-app
+        if: steps.recheck.outputs.ok == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.agent-app-client-id }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-organization-projects: write
+
+      # The one merge call, bound to the judged head by `sha`. Inline text only.
+      - name: Merge as the Agent App
+        id: merge
+        if: steps.recheck.outputs.ok == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          STALE_GATE: ${{ inputs.stale-gate }}
+        with:
+          github-token: ${{ steps.agent-app.outputs.token }}
+          script: |
+            // BEGIN merge-call
+            const fs = require('fs');
+            const path = require('path');
+            const temp = process.env.RUNNER_TEMP;
+            const v = JSON.parse(fs.readFileSync(path.join(temp, 'merge-verdict.json'), 'utf8'));
+            const { owner, repo } = context.repo;
+            const wait = Number(process.env.MERGE_RETRY_MS || 20000);
+            // With the stale-gate rule on, a base that moved makes the gate stale: refuse instead of retrying.
+            const staleGateOn = ['on', 'true', 'yes', '1'].includes(String(process.env.STALE_GATE || '').toLowerCase());
+            let last = '';
+            for (let attempt = 1; attempt <= 5; attempt += 1) {
+              try {
+                const { data } = await github.rest.pulls.merge({ owner, repo, pull_number: v.pr, sha: v.headSha, merge_method: v.method });
+                if (data && data.merged === true && /^[0-9a-f]{40}$/.test(data.sha || '')) {
+                  fs.writeFileSync(path.join(temp, 'merge-result.json'), JSON.stringify({ state: 'merged', sha: data.sha, method: v.method }));
+                  core.setOutput('merged', 'true');
+                  return;
+                }
+                last = 'GitHub answered without merging';
+                break;
+              } catch (error) {
+                const status = (error && error.status) || '?';
+                last = `HTTP ${status}: ${String((error && error.message) || '').slice(0, 400)}`;
+                if (status === 405 && /Base branch was modified/i.test(last) && !staleGateOn && attempt < 5) {
+                  await new Promise((resolve) => setTimeout(resolve, wait));
+                  continue;
+                }
+                break;
+              }
+            }
+            let reason = `The merge call did not merge (${last}).`;
+            if (/required status checks? (are|is) expected|Required status check .* is expected/i.test(last)) {
+              reason = 'GitHub does not count a required check that looks green: it sits in a check suite a later run superseded (omni237#1238). Push an empty commit to the PR branch, then comment /merge with the same reviewed sha (a same-tree head is accepted).';
+            } else if (/code owner review|other than the last pusher/i.test(last)) {
+              reason = `Only a code-owner rule blocks the merge. The owner bypass of merge-pr.sh uses the owner's own login and is not available here: the owner merges it. (${last})`;
+            } else if (/Base branch was modified/i.test(last) && staleGateOn) {
+              reason = `The base moved while merging, so the gate no longer tested the current base (stale-gate rule). Re-run the gate, then comment /merge again. (${last})`;
+            }
+            fs.writeFileSync(path.join(temp, 'merge-result.json'), JSON.stringify({ state: 'refused', reason }));
+            core.setFailed(reason);
+            // END merge-call
+
+      # After a merge into dev: close each issue of this repository the body closes, say where it lives, and
+      # set its Status on every Project to "In dev" (or "Done"). Never fails the job. Inline text only.
+      - name: Done in dev
+        if: steps.merge.outputs.merged == 'true'
+        continue-on-error: true
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ steps.agent-app.outputs.token }}
+          script: |
+            // BEGIN done-in-dev
+            const fs = require('fs');
+            const path = require('path');
+            const v = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'merge-verdict.json'), 'utf8'));
+            if (v.base !== 'dev') return;
+            const { owner, repo } = context.repo;
+            const re = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[: ]+((?:https:\/\/github\.com\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:#|\/issues\/)[0-9]+|#[0-9]+)/gi;
+            const numbers = new Set();
+            const elsewhere = new Set();
+            for (const m of String(v.body || '').matchAll(re)) {
+              const ref = m[1].replace(/^https:\/\/github\.com\//i, '').replace('/issues/', '#');
+              if (ref.startsWith('#')) { numbers.add(Number(ref.slice(1))); continue; }
+              const [full, n] = ref.split('#');
+              if (full.toLowerCase() === `${owner}/${repo}`.toLowerCase()) numbers.add(Number(n));
+              else elsewhere.add(ref);
+            }
+            const query = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){projectItems(first:10){nodes{id project{id field(name:"Status"){... on ProjectV2SingleSelectField{id options{id name}}}}}}}}}';
+            const mutation = 'mutation($pid:ID!,$iid:ID!,$fid:ID!,$oid:String!){updateProjectV2ItemFieldValue(input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{singleSelectOptionId:$oid}}){projectV2Item{id}}}';
+            for (const n of numbers) {
+              if (!Number.isSafeInteger(n) || n < 1) continue;
+              try {
+                const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: n });
+                if (!issue || issue.state !== 'open' || issue.pull_request) continue;
+                await github.rest.issues.createComment({ owner, repo, issue_number: n,
+                  body: `Done in \`dev\` by ${owner}/${repo}#${v.pr}. It reaches \`test\` (tst) at the next dev→test promotion.` });
+                await github.rest.issues.update({ owner, repo, issue_number: n, state: 'closed', state_reason: 'completed' });
+                const data = await github.graphql(query, { o: owner, r: repo, n });
+                const nodes = (((data || {}).repository || {}).issue || {}).projectItems;
+                for (const item of (nodes && nodes.nodes) || []) {
+                  const field = item.project && item.project.field;
+                  const options = (field && field.options) || [];
+                  const option = options.find((o) => o.name === 'In dev') || options.find((o) => o.name === 'Done');
+                  if (!field || !option) continue;
+                  await github.graphql(mutation, { pid: item.project.id, iid: item.id, fid: field.id, oid: option.id });
+                }
+                core.info(`done-in-dev: closed #${n}`);
+              } catch (error) {
+                core.warning(`done-in-dev: #${n} not updated (HTTP ${(error && error.status) || '?'})`);
+              }
+            }
+            if (elsewhere.size) core.warning(`done-in-dev: issues in other repositories are left for their lead: ${[...elsewhere].join(', ')}`);
+            // END done-in-dev
+
+      # Every outcome is said on the PR: merged, or FAIL <reason>. Read token plus issues: write.
+      - name: Report on the pull request
+        if: always() && github.event.issue.number
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            // BEGIN report
+            const fs = require('fs');
+            const path = require('path');
+            const file = path.join(process.env.RUNNER_TEMP, 'merge-result.json');
+            const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            let result = null;
+            try { result = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { result = null; }
+            const body = result && result.state === 'merged'
+              ? `Merged as ${result.sha} (${result.method}), \`review/independent\` posted by the Reviewer App. Run: ${run}`
+              : `FAIL ${(result && result.reason) || 'the merge job stopped before a verdict (the pin check or a step failed); nothing was merged.'} Run: ${run}`;
+            await github.rest.issues.createComment({ ...context.repo, issue_number: context.payload.issue.number, body: body.slice(0, 60000) });
+            // END report

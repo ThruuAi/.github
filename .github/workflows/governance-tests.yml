@@ -41,6 +41,10 @@ jobs:
         run: node governance/tests/issue-link-publish.test.js
       - name: issue-link publisher, mutation proof
         run: node governance/tests/issue-link-publish.mutations.js
+      - name: merge-on-accept (judge, recheck and inline scripts, fake API; ThruuAi/.github#22)
+        run: node governance/tests/merge-on-accept.test.js
+      - name: merge-on-accept, mutation proof
+        run: node governance/tests/merge-on-accept.mutations.js
       - name: bootstrap (stub gh, no network)
         run: node governance/tests/bootstrap.test.js
       # The identity suite starts zsh as login and interactive shells, as the
